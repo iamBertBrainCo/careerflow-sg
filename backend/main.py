@@ -1,14 +1,13 @@
 """
 CareerFlow SG — Backend
 Autonomous multi-agent career workflow engine for Singapore job seekers.
-Built for Meta Global AI Developer Hackathon 2026.
 """
 
 import os
 import json
 import httpx
 import asyncio
-from typing import Optional
+from typing import Optional, Union
 from pathlib import Path
 from datetime import datetime
 import tempfile
@@ -26,15 +25,15 @@ load_dotenv()
 
 # ─── Configuration ───────────────────────────────────────────────
 # Groq API Configuration (Free & Fast)
-META_API_KEY = os.getenv("MODEL_API_KEY", "")
-META_BASE_URL = "https://api.groq.com/openai/v1"
+LLM_API_KEY = os.getenv("MODEL_API_KEY", "")
+LLM_BASE_URL = "https://api.groq.com/openai/v1"
 MCF_API_BASE = os.getenv("MCF_API_BASE", "https://api.mycareersfuture.gov.sg/v2")
 MODEL_ID = "llama-3.3-70b-versatile" # Using Llama 3.3 70B on Groq
 
 app = FastAPI(
     title="CareerFlow SG",
     description="Autonomous multi-agent career workflow engine for Singapore",
-    version="1.0.0-hackathon",
+    version="1.0.0",
 )
 
 app.add_middleware(
@@ -98,20 +97,20 @@ class InterviewPrep(BaseModel):
     company_research: dict = {}
     negotiation_tips: list[str] = []
 
-# ─── Meta Model API Client ───────────────────────────────────────
+# ─── LLM Client (Groq) ───────────────────────────────────────────
 
-async def call_meta_api(
+async def call_llm(
     system_prompt: str,
     user_prompt: str,
     tools: Optional[list] = None,
     response_format: Optional[dict] = None,
     max_tokens: int = 4096,
 ) -> str:
-    """Call Meta Model API withMuse Spark 1.3."""
-    if not META_API_KEY:
+    """Call the LLM (Groq, OpenAI-compatible chat completions)."""
+    if not LLM_API_KEY:
         raise HTTPException(
             status_code=500,
-            detail="Meta API key not configured. Set MODEL_API_KEY in .env",
+            detail="LLM API key not configured. Set MODEL_API_KEY in .env",
         )
 
     messages = [
@@ -132,9 +131,9 @@ async def call_meta_api(
             payload["response_format"] = response_format
 
         response = await client.post(
-            f"{META_BASE_URL}/chat/completions",
+            f"{LLM_BASE_URL}/chat/completions",
             headers={
-                "Authorization": f"Bearer {META_API_KEY}",
+                "Authorization": f"Bearer {LLM_API_KEY}",
                 "Content-Type": "application/json",
             },
             json=payload,
@@ -143,19 +142,19 @@ async def call_meta_api(
         if response.status_code != 200:
             raise HTTPException(
                 status_code=response.status_code,
-                detail=f"Meta API error: {response.text}",
+                detail=f"LLM API error: {response.text}",
             )
 
         data = response.json()
         return data["choices"][0]["message"]["content"]
 
-async def call_meta_api_structured(
+async def call_llm_structured(
     system_prompt: str,
     user_prompt: str,
     schema: dict,
 ) -> dict:
-    """Call Meta Model API with structured JSON output."""
-    text = await call_meta_api(
+    """Call the LLM and parse a structured JSON response."""
+    text = await call_llm(
         system_prompt=system_prompt,
         user_prompt=user_prompt,
         response_format={"type": "json_schema", "json_schema": {"schema": schema}},
@@ -261,7 +260,7 @@ Return valid JSON matching the schema."""
         "required": ["name", "title", "summary", "skills", "experience_years"],
     }
 
-    result = await call_meta_api_structured(system_prompt, resume_text, schema)
+    result = await call_llm_structured(system_prompt, resume_text, schema)
     return ProfileData(**result)
 
 async def agent_match_jobs(
@@ -325,7 +324,7 @@ Return a JSON array with job UUIDs and their match scores."""
         "required": ["scores"],
     }
 
-    result = await call_meta_api_structured(system_prompt, user_prompt, schema)
+    result = await call_llm_structured(system_prompt, user_prompt, schema)
 
     # Apply scores to jobs
     score_map = {s["uuid"]: s["match_score"] for s in result.get("scores", [])}
@@ -414,7 +413,7 @@ and expected costs with SkillsFuture subsidies."""
         "required": ["missing_skills", "recommended_courses"],
     }
 
-    result = await call_meta_api_structured(system_prompt, user_prompt, schema)
+    result = await call_llm_structured(system_prompt, user_prompt, schema)
     return GapAnalysis(**result)
 
 async def agent_rewrite_resume(
@@ -452,7 +451,7 @@ Description: {target_job.description[:2000]}"""
         "required": ["rewritten_summary", "optimized_bullets"],
     }
 
-    result = await call_meta_api_structured(system_prompt, user_prompt, schema)
+    result = await call_llm_structured(system_prompt, user_prompt, schema)
     return ResumeRewrite(**result)
 
 async def agent_interview_prep(
@@ -514,7 +513,7 @@ Salary Range: ${target_job.salary_min or 'N/A'} - ${target_job.salary_max or 'N/
         "required": ["behavioral_questions", "technical_questions"],
     }
 
-    result = await call_meta_api_structured(system_prompt, user_prompt, schema)
+    result = await call_llm_structured(system_prompt, user_prompt, schema)
     return InterviewPrep(**result)
 
 # ─── API Endpoints ───────────────────────────────────────────────
@@ -524,7 +523,7 @@ async def health():
     return {
         "status": "ok",
         "service": "CareerFlow SG",
-        "meta_api_configured": bool(META_API_KEY),
+        "llm_configured": bool(LLM_API_KEY),
         "model": MODEL_ID,
     }
 

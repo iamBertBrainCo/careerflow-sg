@@ -26,8 +26,8 @@ if [ ! -f backend/.env ]; then
     echo ""
     echo "⚠️  Creating backend/.env..."
     cp backend/.env.example backend/.env
-    echo "   → Please edit backend/.env and add your Meta API key"
-    echo "   → Get your key at: https://dev.meta.ai → Dashboard → API Keys"
+    echo "   → Please edit backend/.env and add your Groq API key"
+    echo "   → Get a free key at: https://console.groq.com/keys"
 fi
 
 # Frontend setup

@@ -82,7 +82,7 @@ Users enter any of these codes to access the app. Tokens are stored in localStor
 
 ## Tech Stack
 
-- **Frontend**: Next.js 15, React, Tailwind CSS
+- **Frontend**: Next.js 16, React 19, Tailwind CSS 4
 - **Backend**: FastAPI, Python 3.11+
 - **AI**: Groq Llama 3.3 70B (free)
 - **Browser Automation**: Playwright
@@ -90,4 +90,4 @@ Users enter any of these codes to access the app. Tokens are stored in localStor
 
 ## License
 
-Built for Meta Global AI Developer Hackathon 2026
+© 2026 CareerFlow SG. All rights reserved.

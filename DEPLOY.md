@@ -26,7 +26,7 @@ Go to https://render.com and sign up (GitHub login works).
 ### 2. Connect GitHub Repo
 1. Push your code to GitHub:
 ```bash
-cd "/Users/yangbertram/Documents/Meta Hackathon/careerflow-sg"
+cd careerflow-sg
 git init
 git add .
 git commit -m "Initial commit"
