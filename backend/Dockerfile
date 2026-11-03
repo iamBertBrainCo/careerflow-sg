@@ -1,59 +1,23 @@
-# Use Python 3.11 with system dependencies
+# CareerFlow SG backend (FastAPI + Playwright Chromium), built for Cloud Run
 FROM python:3.11-slim
 
-# Install system dependencies for Playwright and PDF processing
-RUN apt-get update && apt-get install -y \
-    wget \
-    curl \
-    gnupg \
-    ca-certificates \
-    libglib2.0-0 \
-    libnss3 \
-    libnspr4 \
-    libatk1.0-0 \
-    libatk-bridge2.0-0 \
-    libcups2 \
-    libdrm2 \
-    libdbus-1-3 \
-    libxkbcommon0 \
-    libx11-6 \
-    libxcomposite1 \
-    libxdamage1 \
-    libxext6 \
-    libxfixes3 \
-    libxrandr2 \
-    libgbm1 \
-    libpango-1.0-0 \
-    libcairo2 \
-    libasound2 \
-    libatspi2.0-0 \
-    fonts-liberation \
-    libappindicator3-1 \
-    xdg-utils \
-    && rm -rf /var/lib/apt/lists/*
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_ROOT_USER_ACTION=ignore
 
-# Set working directory
 WORKDIR /app
 
-# Copy requirements first (for Docker caching)
+# Copy requirements first (for Docker layer caching)
 COPY requirements.txt .
+RUN pip install --upgrade pip && pip install -r requirements.txt
 
-# Install Python dependencies (no cache to save space)
-RUN pip install --no-cache-dir --upgrade pip setuptools wheel --root-user-action=ignore
-RUN pip install --no-cache-dir -r requirements.txt --root-user-action=ignore
+# Chromium plus exactly the system libraries it needs on this Debian release
+RUN playwright install --with-deps chromium \
+    && rm -rf /var/lib/apt/lists/*
 
-# Install Playwright browsers (deps already installed manually above)
-RUN playwright install chromium
-# Skip playwright install-deps - we already installed all system deps manually
-
-# Copy application code
+# Application code (.dockerignore keeps .env and venv out of the image)
 COPY . .
 
-# Create temp directory for generated files
-RUN mkdir -p /tmp/careerflow
-
-# Expose port
-EXPOSE 10000
-
-# Run the application
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "10000"]
+# Cloud Run sets $PORT (default 8080); Render and local runs can override it
+CMD exec uvicorn main:app --host 0.0.0.0 --port "${PORT:-8080}"

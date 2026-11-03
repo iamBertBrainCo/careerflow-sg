@@ -5,6 +5,9 @@ Autonomous multi-agent career workflow engine for Singapore job seekers.
 
 import os
 import json
+import hmac
+import time
+import hashlib
 import httpx
 import asyncio
 from typing import Optional, Union
@@ -50,6 +53,20 @@ BROWSER_ARGS = [
 MAX_RESUME_BYTES = 10 * 1024 * 1024
 MAX_RESUME_PAGES = 10
 MAX_RESUME_CHARS = 30_000
+
+# Every API route except sign-in needs a valid invite token, so strangers can't
+# spend the hosting budget or the Groq quota. Registered before CORS (runs inside it).
+PUBLIC_API_PATHS = {"/api/auth/verify", "/api/auth/check"}
+
+@app.middleware("http")
+async def require_invite_token(request, call_next):
+    path = request.url.path
+    if request.method != "OPTIONS" and path.startswith("/api/") and path not in PUBLIC_API_PATHS:
+        auth = request.headers.get("authorization", "")
+        token = auth[7:] if auth.lower().startswith("bearer ") else ""
+        if not token_is_valid(token):
+            return JSONResponse(status_code=401, content={"detail": "Please sign in with your invite code again."})
+    return await call_next(request)
 
 # Registered before CORS so it runs inside it: unhandled errors come back as JSON
 # with CORS headers, instead of a bare 500 the browser reports as "Failed to fetch".
@@ -1024,8 +1041,41 @@ async def agent_apply_to_job(
 
 # ─── Authentication (Invite Code Gatekeeping) ────────────────────
 
-# Simple invite codes - in production, store these in a database
-INVITE_CODES = set(os.getenv("INVITE_CODES", "careerflow2026,hackathon,metaai").split(","))
+INVITE_CODES = {
+    c.strip() for c in os.getenv("INVITE_CODES", "careerflow2026,hackathon,metaai").split(",") if c.strip()
+}
+TOKEN_TTL_SECONDS = 30 * 24 * 3600
+
+# Signing key for access tokens. Set AUTH_SECRET in production; the fallback is
+# derived from other secrets so tokens survive restarts without extra setup.
+AUTH_SECRET = (
+    os.getenv("AUTH_SECRET")
+    or hashlib.sha256(f"careerflow:{LLM_API_KEY}:{sorted(INVITE_CODES)}".encode()).hexdigest()
+).encode()
+
+def _code_tag(code: str) -> str:
+    return hashlib.sha256(code.encode()).hexdigest()[:12]
+
+def _sign(payload: str) -> str:
+    return hmac.new(AUTH_SECRET, payload.encode(), hashlib.sha256).hexdigest()
+
+def issue_token(code: str) -> str:
+    """Signed token: v1.<expiry>.<code tag>.<signature>. Removing a code revokes its tokens."""
+    payload = f"v1.{int(time.time()) + TOKEN_TTL_SECONDS}.{_code_tag(code)}"
+    return f"{payload}.{_sign(payload)}"
+
+def token_is_valid(token: str) -> bool:
+    try:
+        version, expiry, tag, signature = token.split(".")
+        payload = f"{version}.{expiry}.{tag}"
+        return (
+            version == "v1"
+            and hmac.compare_digest(signature, _sign(payload))
+            and int(expiry) > time.time()
+            and tag in {_code_tag(c) for c in INVITE_CODES}
+        )
+    except (ValueError, AttributeError):
+        return False
 
 class AuthRequest(BaseModel):
     invite_code: str
@@ -1033,22 +1083,15 @@ class AuthRequest(BaseModel):
 @app.post("/api/auth/verify")
 async def verify_invite_code(req: AuthRequest):
     """Verify an invite code and return an access token."""
-    if req.invite_code in INVITE_CODES:
-        # Simple token - in production use JWT
-        token = f"cf_{req.invite_code}_{datetime.now().timestamp()}"
-        return {"token": token, "valid": True}
+    code = req.invite_code.strip()
+    if code in INVITE_CODES:
+        return {"token": issue_token(code), "valid": True}
     return {"token": None, "valid": False, "error": "Invalid invite code"}
 
 @app.get("/api/auth/check")
 async def check_auth(token: str = ""):
     """Check if the provided token is valid."""
-    if not token:
-        return {"authenticated": False}
-    # Extract code from token
-    parts = token.split("_")
-    if len(parts) >= 2 and parts[1] in INVITE_CODES:
-        return {"authenticated": True}
-    return {"authenticated": False}
+    return {"authenticated": token_is_valid(token)}
 
 # ─── Agentic Apply Endpoints ─────────────────────────────────────
 

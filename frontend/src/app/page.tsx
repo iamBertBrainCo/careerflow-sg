@@ -79,7 +79,13 @@ const NETWORK_ERROR =
  */
 async function postWithRetry(url: string, body: FormData, retry = true): Promise<Response> {
   try {
-    const res = await fetch(url, { method: "POST", body });
+    const token = localStorage.getItem("cf_token") || "";
+    const res = await fetch(url, { method: "POST", body, headers: { Authorization: `Bearer ${token}` } });
+    if (res.status === 401) {
+      // Token expired or invite code revoked: back to the sign-in screen
+      localStorage.removeItem("cf_token");
+      window.dispatchEvent(new Event("cf:signed-out"));
+    }
     if (retry && [502, 503, 504].includes(res.status)) throw new TypeError("gateway");
     return res;
   } catch (e) {
@@ -170,6 +176,13 @@ export default function Home() {
     check
       .catch(() => false)
       .then(ok => setAuth(ok ? "signed-in" : "signed-out"));
+
+    const onSignedOut = () => {
+      setAuth("signed-out");
+      setAuthError("Your session has ended. Please enter your invite code again.");
+    };
+    window.addEventListener("cf:signed-out", onSignedOut);
+    return () => window.removeEventListener("cf:signed-out", onSignedOut);
   }, []);
 
   const handleAuth = useCallback(async () => {
