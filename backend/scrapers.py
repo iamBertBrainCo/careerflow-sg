@@ -10,7 +10,7 @@ from datetime import datetime
 from playwright.async_api import async_playwright, Page
 
 # Re-use JobListing model from main
-from main import JobListing
+from main import JobListing, BROWSER_ARGS, BROWSER_LOCK
 
 
 async def scrape_jobstreet(
@@ -23,7 +23,7 @@ async def scrape_jobstreet(
 
     try:
         async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=True)
+            browser = await p.chromium.launch(headless=True, args=BROWSER_ARGS)
             context = await browser.new_context(
                 viewport={"width": 1280, "height": 900},
                 user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -108,7 +108,7 @@ async def scrape_indeed_sg(
 
     try:
         async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=True)
+            browser = await p.chromium.launch(headless=True, args=BROWSER_ARGS)
             context = await browser.new_context(
                 viewport={"width": 1280, "height": 900},
                 user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -191,7 +191,7 @@ async def scrape_linkedin_jobs(
 
     try:
         async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=True)
+            browser = await p.chromium.launch(headless=True, args=BROWSER_ARGS)
             context = await browser.new_context(
                 viewport={"width": 1280, "height": 900},
                 user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -264,7 +264,7 @@ async def scrape_glassdoor_sg(
 
     try:
         async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=True)
+            browser = await p.chromium.launch(headless=True, args=BROWSER_ARGS)
             context = await browser.new_context(
                 viewport={"width": 1280, "height": 900},
                 user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -355,25 +355,37 @@ async def scrape_all_portals(
     # Import MCF search
     from main import search_mcf_jobs
     
-    tasks = []
-    
-    if "mcf" in sources:
-        tasks.append(search_mcf_jobs(query, limit=per_source))
-    
-    if "jobstreet" in sources:
-        tasks.append(scrape_jobstreet(query, limit=per_source))
-    
-    if "indeed" in sources:
-        tasks.append(scrape_indeed_sg(query, limit=per_source))
-    
-    if "linkedin" in sources:
-        tasks.append(scrape_linkedin_jobs(query, limit=per_source))
-    
-    if "glassdoor" in sources:
-        tasks.append(scrape_glassdoor_sg(query, limit=per_source))
-    
-    # Run all scrapers in parallel
-    results = await asyncio.gather(*tasks, return_exceptions=True)
+    browser_scrapers = {
+        "jobstreet": scrape_jobstreet,
+        "indeed": scrape_indeed_sg,
+        "linkedin": scrape_linkedin_jobs,
+        "glassdoor": scrape_glassdoor_sg,
+    }
+
+    async def run_browser_scrapers() -> list:
+        # One Chromium at a time: four in parallel exceed the 512 MB free tier
+        out = []
+        for key, scraper in browser_scrapers.items():
+            if key not in sources:
+                continue
+            try:
+                async with BROWSER_LOCK:
+                    out.append(await scraper(query, limit=per_source))
+            except Exception as e:
+                out.append(e)
+        return out
+
+    async def run_mcf() -> list:
+        if "mcf" not in sources:
+            return []
+        try:
+            return [await search_mcf_jobs(query, limit=per_source)]
+        except Exception as e:
+            return [e]
+
+    # The MCF API call runs alongside the (sequential) browser scrapers
+    browser_results, mcf_results = await asyncio.gather(run_browser_scrapers(), run_mcf())
+    results = mcf_results + browser_results
     
     for result in results:
         if isinstance(result, list):

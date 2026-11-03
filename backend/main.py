@@ -37,6 +37,16 @@ app = FastAPI(
     version="1.0.0",
 )
 
+# Headless Chromium is the biggest memory user on the 512 MB free tier (each
+# browser ~150-300 MB): allow one at a time and launch it lean, without images.
+BROWSER_LOCK = asyncio.Semaphore(1)
+BROWSER_ARGS = [
+    "--disable-dev-shm-usage",
+    "--disable-gpu",
+    "--disable-extensions",
+    "--blink-settings=imagesEnabled=false",
+]
+
 MAX_RESUME_BYTES = 10 * 1024 * 1024
 MAX_RESUME_PAGES = 10
 MAX_RESUME_CHARS = 30_000
@@ -831,7 +841,7 @@ async def agent_apply_to_job(
     
     try:
         async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=True)
+            browser = await p.chromium.launch(headless=True, args=BROWSER_ARGS)
             context = await browser.new_context(
                 viewport={"width": 1280, "height": 900},
                 user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -1111,8 +1121,9 @@ async def apply_to_job(
     
     resume_path = await generate_resume_docx(profile, None, target_job)
     
-    # Step 3: Browser automation - fill and submit
-    result = await agent_apply_to_job(job_url, resume_path, profile)
+    # Step 3: Browser automation - fill and submit (one browser at a time)
+    async with BROWSER_LOCK:
+        result = await agent_apply_to_job(job_url, resume_path, profile)
     
     # Cleanup temp file
     try:
