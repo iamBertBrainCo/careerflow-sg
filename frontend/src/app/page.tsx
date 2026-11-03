@@ -70,6 +70,26 @@ const sourceLabel = (key: string) => allSources.find(s => s.key === key)?.label 
 
 const money = (n?: number | null) => (n ? `S$${n.toLocaleString()}` : "");
 
+const NETWORK_ERROR =
+  "We couldn't reach the CareerFlow server. It may be waking up or restarting. Please try again in a minute.";
+
+/**
+ * POST that retries once on a network failure or gateway error (the free-tier
+ * backend sleeps and restarts). Not for non-idempotent actions like auto-apply.
+ */
+async function postWithRetry(url: string, body: FormData, retry = true): Promise<Response> {
+  try {
+    const res = await fetch(url, { method: "POST", body });
+    if (retry && [502, 503, 504].includes(res.status)) throw new TypeError("gateway");
+    return res;
+  } catch (e) {
+    if (!(e instanceof TypeError)) throw e;
+    if (!retry) throw new Error(NETWORK_ERROR);
+    await new Promise(r => setTimeout(r, 4000));
+    return postWithRetry(url, body, false);
+  }
+}
+
 /** Pull FastAPI's `detail` out of an error response instead of showing raw JSON. */
 async function readError(res: Response): Promise<string> {
   const text = await res.text();
@@ -187,7 +207,8 @@ export default function Home() {
     setBusy(kind);
     setError(null);
     try {
-      const res = await fetch(`${API_BASE}${path}`, { method: "POST", body: form });
+      const res = await postWithRetry(`${API_BASE}${path}`, form, kind !== "apply");
+      if ([502, 503, 504].includes(res.status)) throw new Error(NETWORK_ERROR);
       if (!res.ok) throw new Error(await readError(res));
       onOk(await res.json());
     } catch (e: any) {
@@ -292,7 +313,8 @@ export default function Home() {
       const form = new FormData();
       form.append("resume_text", profileText(true));
       form.append("job_uuid", selectedJob.uuid);
-      const res = await fetch(`${API_BASE}/api/resume/generate-docx`, { method: "POST", body: form });
+      const res = await postWithRetry(`${API_BASE}/api/resume/generate-docx`, form);
+      if ([502, 503, 504].includes(res.status)) throw new Error(NETWORK_ERROR);
       if (!res.ok) throw new Error(await readError(res));
       const blob = await res.blob();
       const url = window.URL.createObjectURL(blob);

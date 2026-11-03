@@ -37,6 +37,23 @@ app = FastAPI(
     version="1.0.0",
 )
 
+MAX_RESUME_BYTES = 10 * 1024 * 1024
+MAX_RESUME_PAGES = 10
+MAX_RESUME_CHARS = 30_000
+
+# Registered before CORS so it runs inside it: unhandled errors come back as JSON
+# with CORS headers, instead of a bare 500 the browser reports as "Failed to fetch".
+@app.middleware("http")
+async def catch_unhandled_errors(request, call_next):
+    try:
+        return await call_next(request)
+    except Exception as e:
+        print(f"Unhandled error on {request.url.path}: {e!r}")
+        return JSONResponse(
+            status_code=500,
+            content={"detail": "Something went wrong on our side. Please try again."},
+        )
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -538,23 +555,33 @@ async def health():
 async def parse_profile(resume: UploadFile = File(...)):
     """Upload a resume (PDF or TXT) and get structured profile data."""
     content = await resume.read()
+    if len(content) > MAX_RESUME_BYTES:
+        raise HTTPException(status_code=413, detail="Resume file is too large (max 10 MB)")
 
-    if resume.filename.endswith(".pdf"):
+    filename = (resume.filename or "").lower()
+    if filename.endswith(".pdf") or content[:5] == b"%PDF-":
         try:
+            import io
             import pdfplumber
-            text = ""
-            with pdfplumber.open(resume.file) as pdf:
-                for page in pdf.pages:
-                    text += page.extract_text() or ""
+            parts = []
+            # Free each page after extracting it: the free hosting tier has 512 MB of RAM
+            with pdfplumber.open(io.BytesIO(content)) as pdf:
+                for page in pdf.pages[:MAX_RESUME_PAGES]:
+                    parts.append(page.extract_text() or "")
+                    page.close()
+            text = "\n".join(parts)
         except Exception as e:
-            raise HTTPException(status_code=400, detail=f"PDF parsing error: {str(e)}")
+            raise HTTPException(status_code=400, detail=f"Couldn't read this PDF: {str(e)}")
     else:
         text = content.decode("utf-8", errors="ignore")
 
     if not text.strip():
-        raise HTTPException(status_code=400, detail="Resume appears to be empty")
+        raise HTTPException(
+            status_code=400,
+            detail="No text found in this resume. If it's a scanned image, paste the text instead.",
+        )
 
-    return await agent_parse_profile(text)
+    return await agent_parse_profile(text[:MAX_RESUME_CHARS])
 
 @app.post("/api/profile/parse-text", response_model=ProfileData)
 async def parse_profile_text(resume_text: str = Form(...)):
