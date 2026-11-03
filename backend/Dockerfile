@@ -39,12 +39,12 @@ WORKDIR /app
 COPY requirements.txt .
 
 # Install Python dependencies (no cache to save space)
-RUN pip install --no-cache-dir --upgrade pip setuptools wheel
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir --upgrade pip setuptools wheel --root-user-action=ignore
+RUN pip install --no-cache-dir -r requirements.txt --root-user-action=ignore
 
-# Install Playwright browsers and dependencies
+# Install Playwright browsers (deps already installed manually above)
 RUN playwright install chromium
-RUN playwright install-deps chromium
+# Skip playwright install-deps - we already installed all system deps manually
 
 # Copy application code
 COPY . .
