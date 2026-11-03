@@ -1,9 +1,0 @@
-# Never ship secrets or local environments
-.env
-.env.*
-!.env.example
-venv/
-.venv/
-__pycache__/
-*.pyc
-.DS_Store

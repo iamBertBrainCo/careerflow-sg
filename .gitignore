@@ -7,6 +7,7 @@ __pycache__/
 *.pyc
 *.pyo
 venv/
+.venv/
 .env
 
 # Node
@@ -27,3 +28,11 @@ playwright-report/
 test-results/
 .vercel
 .env*
+
+# SkillsFuture data: each user downloads it (python backend/data/build_skills_framework.py --download)
+backend/data/skills_framework.json.gz
+!.env.example
+!backend/.env.example
+
+# Local tooling
+.claude/

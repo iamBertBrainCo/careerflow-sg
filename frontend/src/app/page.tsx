@@ -2,53 +2,27 @@
 import { useState, useCallback, useEffect, type ReactNode } from "react";
 import {
   Upload, Search, TrendingUp, FileText, MessageSquare, Sparkles, ArrowRight, ArrowLeft, CheckCircle2,
-  Loader2, Briefcase, MapPin, Clock, BookOpen, Target, Lock, Send, Download, LogOut, ExternalLink,
+  Loader2, Briefcase, MapPin, Clock, Target, Lock, LogOut, ExternalLink,
   Wallet, FileUp, Building2, Lightbulb, ShieldCheck, Check, AlertTriangle, X, GraduationCap,
 } from "lucide-react";
 import { Logo, LogoMark } from "@/components/Logo";
+import { ProfileEditor, emptyContact, missingApplyDetails, type Profile } from "@/components/ProfileEditor";
+import { TailorWorkspace } from "@/components/TailorWorkspace";
+import { SkillGaps, type GapResult } from "@/components/SkillGaps";
+import { API_BASE, NETWORK_ERROR, postWithRetry, readError } from "@/lib/api";
+import type { Job, Tailored, ResumeDoc } from "@/lib/types";
 import {
   Button, Card, CardHeader, Badge, ScoreRing, PageHeader, EmptyState, inputClass, levelTone,
 } from "@/components/ui";
 
-const API_BASE = process.env.NEXT_PUBLIC_API_BASE || "http://localhost:8000";
-
 type Step = "upload" | "discover" | "gaps" | "prepare" | "interview";
-type Busy = "parse" | "search" | "gaps" | "rewrite" | "interview" | "download" | "apply" | null;
+type Busy = "parse" | "search" | "gaps" | "interview" | "apply" | null;
 type AuthState = "checking" | "signed-out" | "signed-in";
 
-interface Job {
-  uuid: string;
-  title: string;
-  company: string;
-  salary_min: number | null;
-  salary_max: number | null;
-  salary_type: string;
-  skills: string[];
-  experience_required: number;
-  location: string;
-  district: string;
-  region: string;
-  employment_type: string;
-  position_level: string;
-  description: string;
-  job_url: string;
-  posted_date: string;
-  views: number;
-  applications: number;
-  match_score: number;
-  source: string;
-}
-
-interface Profile {
-  name: string;
-  title: string;
-  summary: string;
-  skills: string[];
-  experience_years: number;
-  education: string[];
-  work_history: any[];
-  certifications: string[];
-}
+const DEVELOPER_LINKEDIN = "https://www.linkedin.com/in/bertramyang";
+const PROFILE_KEY = "cf_profile";
+const PAGE_SIZE = 10;
+const MAX_SELECTED = 5;  // free AI tiers: tailoring is one resume at a time
 
 const steps: { key: Step; label: string; icon: typeof Upload }[] = [
   { key: "upload", label: "Profile", icon: Upload },
@@ -69,42 +43,6 @@ const allSources = [
 const sourceLabel = (key: string) => allSources.find(s => s.key === key)?.label ?? key;
 
 const money = (n?: number | null) => (n ? `S$${n.toLocaleString()}` : "");
-
-const NETWORK_ERROR =
-  "We couldn't reach the CareerFlow server. It may be waking up or restarting. Please try again in a minute.";
-
-/**
- * POST that retries once on a network failure or gateway error (the free-tier
- * backend sleeps and restarts). Not for non-idempotent actions like auto-apply.
- */
-async function postWithRetry(url: string, body: FormData, retry = true): Promise<Response> {
-  try {
-    const token = localStorage.getItem("cf_token") || "";
-    const res = await fetch(url, { method: "POST", body, headers: { Authorization: `Bearer ${token}` } });
-    if (res.status === 401) {
-      // Token expired or invite code revoked: back to the sign-in screen
-      localStorage.removeItem("cf_token");
-      window.dispatchEvent(new Event("cf:signed-out"));
-    }
-    if (retry && [502, 503, 504].includes(res.status)) throw new TypeError("gateway");
-    return res;
-  } catch (e) {
-    if (!(e instanceof TypeError)) throw e;
-    if (!retry) throw new Error(NETWORK_ERROR);
-    await new Promise(r => setTimeout(r, 4000));
-    return postWithRetry(url, body, false);
-  }
-}
-
-/** Pull FastAPI's `detail` out of an error response instead of showing raw JSON. */
-async function readError(res: Response): Promise<string> {
-  const text = await res.text();
-  try {
-    const data = JSON.parse(text);
-    if (typeof data.detail === "string") return data.detail;
-  } catch {}
-  return text || `Request failed (${res.status})`;
-}
 
 function Bullet({ children }: { children: ReactNode }) {
   return (
@@ -129,25 +67,50 @@ export default function Home() {
   const [step, setStep] = useState<Step>("upload");
   const [maxStep, setMaxStep] = useState(0);
   const [busy, setBusy] = useState<Busy>(null);
+  const [setupIssues, setSetupIssues] = useState<string[]>([]);
   const [error, setError] = useState<string | null>(null);
 
   const [resumeText, setResumeText] = useState("");
   const [dragOver, setDragOver] = useState(false);
-  const [profile, setProfile] = useState<Profile | null>(null);
+  // Restored from this browser (if saved) when the page state is created
+  const [profile, setProfile] = useState<Profile | null>(() => {
+    if (typeof window === "undefined") return null;
+    try {
+      const saved = localStorage.getItem(PROFILE_KEY);
+      return saved ? { ...emptyContact, ...JSON.parse(saved) } : null;
+    } catch {
+      return null;
+    }
+  });
+  const [uploadMode, setUploadMode] = useState(false);
+  const [highlightDetails, setHighlightDetails] = useState<string[]>([]);
 
-  const [targetRole, setTargetRole] = useState("");
+  const [targetRole, setTargetRole] = useState(() => profile?.title ?? "");
   const [targetIndustry, setTargetIndustry] = useState("");
   const [selectedSources, setSelectedSources] = useState<string[]>(["mcf"]);
   const [jobs, setJobs] = useState<Job[]>([]);
   const [searched, setSearched] = useState(false);
-  const [selectedJob, setSelectedJob] = useState<Job | null>(null);
+  const [minSalary, setMinSalary] = useState("");
+  const [employmentType, setEmploymentType] = useState("");
+  const [showCount, setShowCount] = useState(PAGE_SIZE);
+  const [selectedJobs, setSelectedJobs] = useState<Job[]>([]);
+  const [activeJobId, setActiveJobId] = useState<string | null>(null);
+  const selectedJob = selectedJobs.find(j => j.uuid === activeJobId) ?? selectedJobs[0] ?? null;
+  const [tailored, setTailored] = useState<Record<string, Tailored>>({});
+  const [template, setTemplateState] = useState(() => {
+    if (typeof window === "undefined") return "ats";
+    try { return localStorage.getItem("cf_template") || "ats"; } catch { return "ats"; }
+  });
+  const setTemplate = (t: string) => {
+    setTemplateState(t);
+    try { localStorage.setItem("cf_template", t); } catch {}
+  };
 
-  const [gapAnalysis, setGapAnalysis] = useState<any>(null);
-  const [resumeRewrite, setResumeRewrite] = useState<any>(null);
-  const [interviewPrep, setInterviewPrep] = useState<any>(null);
+  const [gapAnalysis, setGapAnalysis] = useState<GapResult | null>(null);
+  const [interviewPreps, setInterviewPreps] = useState<Record<string, any>>({});
+  const interviewPrep = selectedJob ? interviewPreps[selectedJob.uuid] : null;
   const [applyResult, setApplyResult] = useState<any>(null);
 
-  const searchQuery = `${targetRole} ${targetIndustry}`.trim();
   const stepIndex = steps.findIndex(s => s.key === step);
 
   const goTo = useCallback((next: Step) => {
@@ -158,11 +121,17 @@ export default function Home() {
     window.scrollTo({ top: 0, behavior: "smooth" });
   }, []);
 
-  const profileText = useCallback((withHistory: boolean) => {
-    if (!profile) return "";
-    let text = `${profile.summary}\nSkills: ${profile.skills.join(", ")}\nExperience: ${profile.experience_years} years`;
-    if (withHistory) text += `\n${JSON.stringify(profile.work_history)}`;
-    return text;
+  /** Every AI step receives the structured profile, so nothing is re-parsed or lost. */
+  const withProfile = useCallback((form: FormData) => {
+    if (profile) form.append("profile_json", JSON.stringify(profile));
+    return form;
+  }, [profile]);
+
+  // Keep the profile (incl. My details) in this browser only, across reloads
+  useEffect(() => {
+    try {
+      if (profile) localStorage.setItem(PROFILE_KEY, JSON.stringify(profile));
+    } catch {}
   }, [profile]);
 
   // Restore an existing session on load
@@ -176,6 +145,14 @@ export default function Home() {
     check
       .catch(() => false)
       .then(ok => setAuth(ok ? "signed-in" : "signed-out"));
+
+    // Workshop-friendly: say clearly if the backend's AI key or SkillsFuture data isn't set up
+    fetch(`${API_BASE}/health`).then(r => r.json()).then(h => {
+      const issues: string[] = [];
+      if (!h.llm_configured) issues.push("No AI key is set up. Copy backend/.env.example to backend/.env, paste your key after MODEL_API_KEY=, and restart the backend.");
+      if (h.skills_framework === false) issues.push("SkillsFuture skill-gap data isn't downloaded yet. In the backend folder run: python data/build_skills_framework.py --download");
+      setSetupIssues(issues);
+    }).catch(() => setSetupIssues(["Can't reach the backend at " + API_BASE + ". Is it running? (see README: Start the app)"]));
 
     const onSignedOut = () => {
       setAuth("signed-out");
@@ -232,16 +209,17 @@ export default function Home() {
   }, []);
 
   const onProfileParsed = (data: Profile) => {
-    setProfile(data);
+    setProfile({ ...emptyContact, ...data });
+    setUploadMode(false);
     setJobs([]);
     setSearched(false);
-    setSelectedJob(null);
+    setSelectedJobs([]);
+    setTailored({});
     setGapAnalysis(null);
-    setResumeRewrite(null);
-    setInterviewPrep(null);
+    setInterviewPreps({});
     setApplyResult(null);
-    if (!targetRole && data.title) setTargetRole(data.title);
-    goTo("discover");
+    if (data.title) setTargetRole(data.title);
+    window.scrollTo({ top: 0, behavior: "smooth" });
   };
 
   const handleFileUpload = (file: File) => {
@@ -259,88 +237,64 @@ export default function Home() {
 
   const handleSearch = () => {
     if (!profile) return;
-    const form = new FormData();
-    form.append("query", searchQuery);
-    form.append("limit", "30");
-    form.append("resume_text", profileText(false));
+    const form = withProfile(new FormData());
+    form.append("query", targetRole);
+    form.append("limit", "200");
     form.append("target_role", targetRole);
     form.append("target_industry", targetIndustry);
     form.append("sources", selectedSources.join(","));
+    form.append("min_salary", minSalary);
+    form.append("employment_type", employmentType);
     run("search", "/api/jobs/match", form, (data: Job[]) => {
       setJobs(data);
       setSearched(true);
+      setShowCount(PAGE_SIZE);
       setGapAnalysis(null);
     });
   };
 
-  const selectJob = (job: Job) => {
-    if (selectedJob?.uuid === job.uuid) return;
-    setSelectedJob(job);
-    setResumeRewrite(null);
-    setInterviewPrep(null);
+  const toggleJob = (job: Job) => {
+    setError(null);
+    setSelectedJobs(prev => {
+      if (prev.some(j => j.uuid === job.uuid)) return prev.filter(j => j.uuid !== job.uuid);
+      if (prev.length >= MAX_SELECTED) {
+        setError(`You can tailor up to ${MAX_SELECTED} resumes at a time. Deselect one first.`);
+        return prev;
+      }
+      return [...prev, job];
+    });
     setApplyResult(null);
-  };
-
-  const handleGapAnalysis = () => {
-    if (!profile) return;
-    const form = new FormData();
-    form.append("query", searchQuery);
-    form.append("resume_text", profileText(false));
-    form.append("target_role", targetRole);
-    form.append("target_industry", targetIndustry);
-    form.append("sources", selectedSources.join(","));
-    run("gaps", "/api/gap-analysis", form, setGapAnalysis);
-  };
-
-  const handleResumeRewrite = () => {
-    if (!profile || !selectedJob) return;
-    const form = new FormData();
-    form.append("resume_text", profileText(true));
-    form.append("job_uuid", selectedJob.uuid);
-    run("rewrite", "/api/resume/rewrite", form, setResumeRewrite);
   };
 
   const handleInterviewPrep = () => {
     if (!profile || !selectedJob) return;
-    const form = new FormData();
-    form.append("resume_text", profileText(false));
+    const form = withProfile(new FormData());
     form.append("job_uuid", selectedJob.uuid);
-    run("interview", "/api/interview/prep", form, setInterviewPrep);
+    form.append("job_json", JSON.stringify(selectedJob));
+    const id = selectedJob.uuid;
+    run("interview", "/api/interview/prep", form, (data) => setInterviewPreps(prev => ({ ...prev, [id]: data })));
   };
 
-  const handleApply = () => {
-    if (!profile || !selectedJob) return;
-    setApplyResult(null);
-    const form = new FormData();
-    form.append("job_url", selectedJob.job_url);
-    form.append("resume_text", profileText(true));
-    form.append("job_uuid", selectedJob.uuid);
-    run("apply", "/api/apply", form, setApplyResult);
-  };
-
-  const handleDownloadResume = async () => {
-    if (!profile || !selectedJob) return;
-    setBusy("download");
-    setError(null);
-    try {
-      const form = new FormData();
-      form.append("resume_text", profileText(true));
-      form.append("job_uuid", selectedJob.uuid);
-      const res = await postWithRetry(`${API_BASE}/api/resume/generate-docx`, form);
-      if ([502, 503, 504].includes(res.status)) throw new Error(NETWORK_ERROR);
-      if (!res.ok) throw new Error(await readError(res));
-      const blob = await res.blob();
-      const url = window.URL.createObjectURL(blob);
-      const a = document.createElement("a");
-      a.href = url;
-      a.download = `${(profile.name || "Resume").replace(/\s+/g, "_")}_Resume.docx`;
-      a.click();
-      window.URL.revokeObjectURL(url);
-    } catch (e: any) {
-      setError(e.message || "Failed to generate resume");
-    } finally {
-      setBusy(null);
+  /** Assisted apply: opens a visible browser, fills your details, attaches the resume. You submit. */
+  const handleApply = (job: Job | null, resume?: ResumeDoc, resumeTemplate = template) => {
+    if (!profile || !job) return;
+    const missing = missingApplyDetails(profile);
+    if (missing.length) {
+      // Never apply with made-up details: send them to My details first
+      setHighlightDetails(missing);
+      setUploadMode(false);
+      goTo("upload");
+      setError(`Add your ${missing.join(", ")} in My details, then come back to apply.`);
+      return;
     }
+    setApplyResult(null);
+    const form = withProfile(new FormData());
+    form.append("job_url", job.job_url);
+    if (resume) form.append("resume_json", JSON.stringify(resume));
+    form.append("template", resumeTemplate);
+    form.append("job_uuid", job.uuid);
+    form.append("job_json", JSON.stringify(job));
+    run("apply", "/api/apply", form, setApplyResult);
   };
 
   // ─── Auth screens ──────────────────────────────────────────────
@@ -386,7 +340,10 @@ export default function Home() {
                 ))}
               </ul>
             </div>
-            <p className="text-xs text-subtle">© {new Date().getFullYear()} CareerFlow SG</p>
+            <p className="text-xs text-subtle">
+              © {new Date().getFullYear()} CareerFlow SG · Developed by{" "}
+              <a href={DEVELOPER_LINKEDIN} target="_blank" rel="noopener noreferrer" className="text-brand hover:underline">Bertram Yang</a>
+            </p>
           </div>
 
           {/* Sign-in form */}
@@ -421,7 +378,7 @@ export default function Home() {
                     spellCheck={false}
                     value={inviteCode}
                     onChange={(e) => setInviteCode(e.target.value)}
-                    placeholder="e.g. careerflow-xxxx"
+                    placeholder="Enter your invite code"
                     className={inputClass}
                   />
                   {authError && (
@@ -438,6 +395,17 @@ export default function Home() {
 
               <p className="text-center text-xs text-subtle mt-6">
                 Don&apos;t have a code? Ask the person who shared CareerFlow with you.
+              </p>
+              <p className="text-center text-sm text-muted mt-4">
+                CareerFlow SG is developed by{" "}
+                <a
+                  href={DEVELOPER_LINKEDIN}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="font-medium text-brand hover:underline"
+                >
+                  Bertram Yang
+                </a>
               </p>
             </div>
           </div>
@@ -539,6 +507,13 @@ export default function Home() {
       </header>
 
       <main className="flex-1 w-full max-w-5xl mx-auto px-4 sm:px-6 py-8 sm:py-10">
+        {setupIssues.length > 0 && (
+          <div className="mb-6 rounded-xl border border-warning/30 bg-warning-soft px-4 py-3 text-sm text-text">
+            <p className="flex items-center gap-2 font-semibold text-warning"><AlertTriangle className="w-4 h-4" /> Setup needed</p>
+            <ul className="mt-1.5 space-y-1 list-disc pl-5">{setupIssues.map(i => <li key={i}>{i}</li>)}</ul>
+          </div>
+        )}
+
         {error && (
           <div role="alert" className="mb-6 flex items-start gap-3 rounded-xl border border-danger/30 bg-danger-soft px-4 py-3 text-sm text-danger animate-fade-in">
             <AlertTriangle className="w-4 h-4 mt-0.5 shrink-0" />
@@ -551,12 +526,37 @@ export default function Home() {
 
         <div key={step} className="animate-fade-in">
           {/* ─── Step 1: Profile ─── */}
-          {step === "upload" && (
+          {step === "upload" && profile && !uploadMode && (
+            <div className="max-w-3xl mx-auto">
+              <PageHeader
+                eyebrow="Step 1"
+                title="Check your profile"
+                description="This is what CareerFlow read from your resume. Fix anything that's wrong; every later step uses it."
+              />
+              <ProfileEditor
+                profile={profile}
+                onChange={(p) => {
+                  setProfile(p);
+                  if (highlightDetails.length) setHighlightDetails(missingApplyDetails(p).filter(k => highlightDetails.includes(k)));
+                }}
+                onContinue={() => goTo("discover")}
+                onReupload={() => setUploadMode(true)}
+                highlight={highlightDetails}
+              />
+            </div>
+          )}
+
+          {step === "upload" && (!profile || uploadMode) && (
             <div className="max-w-2xl mx-auto">
               <PageHeader
                 eyebrow="Step 1"
                 title="Start with your resume"
                 description="We'll read your experience and skills, then match you with roles across Singapore."
+                action={profile ? (
+                  <Button variant="ghost" size="sm" onClick={() => setUploadMode(false)} icon={<ArrowLeft className="w-4 h-4" />}>
+                    Back to my profile
+                  </Button>
+                ) : undefined}
               />
 
               <label
@@ -635,7 +635,7 @@ export default function Home() {
                 description={<>Matching for <span className="text-ink font-medium">{profile.name}</span> · {profile.title} · {profile.experience_years} yrs experience</>}
                 action={
                   <Button variant="ghost" size="sm" onClick={() => goTo("upload")} icon={<ArrowLeft className="w-4 h-4" />}>
-                    Change resume
+                    Edit profile
                   </Button>
                 }
               />
@@ -669,6 +669,44 @@ export default function Home() {
                         placeholder="e.g. Finance, Healthcare"
                         className={inputClass}
                       />
+                    </div>
+                  </div>
+
+                  <div className="grid gap-4 sm:grid-cols-2">
+                    <div>
+                      <label htmlFor="min-salary" className="block text-sm font-medium text-ink mb-1.5">
+                        Minimum monthly salary <span className="text-subtle font-normal">(optional)</span>
+                      </label>
+                      <div className="relative">
+                        <span className="absolute left-3.5 top-1/2 -translate-y-1/2 text-sm text-muted">S$</span>
+                        <input
+                          id="min-salary"
+                          type="number"
+                          inputMode="numeric"
+                          min={0}
+                          step={100}
+                          value={minSalary}
+                          onChange={(e) => setMinSalary(e.target.value)}
+                          placeholder="e.g. 4000"
+                          className={`${inputClass} pl-10`}
+                        />
+                      </div>
+                    </div>
+                    <div>
+                      <label htmlFor="emp-type" className="block text-sm font-medium text-ink mb-1.5">Employment type</label>
+                      <select
+                        id="emp-type"
+                        value={employmentType}
+                        onChange={(e) => setEmploymentType(e.target.value)}
+                        className={inputClass}
+                      >
+                        <option value="">Any</option>
+                        <option value="Full Time">Full time</option>
+                        <option value="Permanent">Permanent</option>
+                        <option value="Contract">Contract</option>
+                        <option value="Part Time">Part time</option>
+                        <option value="Internship/Attachment">Internship</option>
+                      </select>
                     </div>
                   </div>
 
@@ -717,18 +755,22 @@ export default function Home() {
                 <div className="pb-24">
                   <div className="flex items-baseline justify-between mb-3">
                     <h3 className="text-base font-semibold text-ink">Top matches</h3>
-                    <p className="text-sm text-muted">Showing {Math.min(jobs.length, 10)} of {jobs.length}</p>
+                    <p className="text-sm text-muted">Showing {Math.min(jobs.length, showCount)} of {jobs.length} ranked</p>
                   </div>
+                  <p className="text-xs text-muted mb-4">
+                    Ranked by title fit, your skills, experience and salary. The top {jobs.filter(j => j.ai_ranked).length} were
+                    also reviewed by AI, which explains each match.
+                  </p>
                   <div className="space-y-3">
-                    {jobs.slice(0, 10).map((job) => {
-                      const selected = selectedJob?.uuid === job.uuid;
+                    {jobs.slice(0, showCount).map((job) => {
+                      const selected = selectedJobs.some(j => j.uuid === job.uuid);
                       return (
                         <div
                           key={job.uuid}
                           role="button"
                           tabIndex={0}
-                          onClick={() => selectJob(job)}
-                          onKeyDown={(e) => (e.key === "Enter" || e.key === " ") && (e.preventDefault(), selectJob(job))}
+                          onClick={() => toggleJob(job)}
+                          onKeyDown={(e) => (e.key === "Enter" || e.key === " ") && (e.preventDefault(), toggleJob(job))}
                           aria-pressed={selected}
                           className={`rounded-xl border bg-surface p-4 sm:p-5 shadow-card cursor-pointer transition-all outline-none focus-visible:ring-4 focus-visible:ring-brand-soft ${
                             selected ? "border-brand ring-4 ring-brand-soft" : "border-line hover:border-line-strong"
@@ -760,15 +802,39 @@ export default function Home() {
                                   <span className="flex items-center gap-1.5"><Briefcase className="w-3.5 h-3.5" />{job.position_level}</span>
                                 )}
                               </div>
-                              {job.skills.length > 0 && (
-                                <div className="flex flex-wrap gap-1.5 mt-3">
-                                  {job.skills.slice(0, 5).map((skill) => <Badge key={skill}>{skill}</Badge>)}
-                                  {job.skills.length > 5 && <Badge>+{job.skills.length - 5}</Badge>}
+                              {job.match_reason && (
+                                <p className="mt-3 flex gap-2 text-sm text-text leading-relaxed">
+                                  <Sparkles className="w-4 h-4 text-brand shrink-0 mt-0.5" />
+                                  <span>{job.match_reason}</span>
+                                </p>
+                              )}
+                              {(job.matched_skills?.length > 0 || job.missing_skills?.length > 0) && (
+                                <div className="mt-3 space-y-1.5">
+                                  {job.matched_skills?.length > 0 && (
+                                    <div className="flex flex-wrap items-center gap-1.5">
+                                      <span className="text-xs text-muted w-16 shrink-0">You have</span>
+                                      {job.matched_skills.slice(0, 6).map(s => <Badge key={s} tone="success">{s}</Badge>)}
+                                    </div>
+                                  )}
+                                  {job.missing_skills?.length > 0 && (
+                                    <div className="flex flex-wrap items-center gap-1.5">
+                                      <span className="text-xs text-muted w-16 shrink-0">To build</span>
+                                      {job.missing_skills.slice(0, 4).map(s => <Badge key={s} tone="warning">{s}</Badge>)}
+                                    </div>
+                                  )}
                                 </div>
                               )}
                             </div>
-                            <ScoreRing score={job.match_score} label="match" />
+                            <ScoreRing score={job.match_score} label={job.ai_ranked ? "AI checked" : "match"} />
                           </div>
+                          {job.score_breakdown && (
+                            <p className="mt-3 text-xs text-muted">
+                              Title {job.score_breakdown.title ?? "–"} · Skills {job.score_breakdown.skills ?? "–"} ·
+                              Experience {job.score_breakdown.experience ?? "–"} · Salary {job.score_breakdown.salary ?? "–"}
+                              {job.score_breakdown.experience_note && <> · {job.score_breakdown.experience_note}</>}
+                              {job.score_breakdown.ai != null && <> · AI score {job.score_breakdown.ai}</>}
+                            </p>
+                          )}
                           <div className="flex items-center justify-between gap-3 mt-4 pt-4 border-t border-line">
                             {job.job_url ? (
                               <a
@@ -782,13 +848,24 @@ export default function Home() {
                               </a>
                             ) : <span />}
                             <span className={`inline-flex items-center gap-1.5 text-sm font-medium ${selected ? "text-brand" : "text-text"}`}>
-                              {selected ? <><CheckCircle2 className="w-4 h-4" /> Selected</> : "Select this job"}
+                              <span className={`w-5 h-5 rounded border flex items-center justify-center ${
+                                selected ? "bg-brand border-brand text-on-brand" : "border-line-strong"}`}>
+                                {selected && <Check className="w-3.5 h-3.5" />}
+                              </span>
+                              {selected ? "Selected" : "Select"}
                             </span>
                           </div>
                         </div>
                       );
                     })}
                   </div>
+                  {showCount < jobs.length && (
+                    <div className="mt-4 flex justify-center">
+                      <Button variant="secondary" onClick={() => setShowCount(c => c + PAGE_SIZE)}>
+                        Show {Math.min(PAGE_SIZE, jobs.length - showCount)} more
+                      </Button>
+                    </div>
+                  )}
                 </div>
               ) : searched && busy !== "search" ? (
                 <EmptyState
@@ -815,235 +892,82 @@ export default function Home() {
                 <div className="fixed inset-x-0 bottom-0 z-30 border-t border-line bg-surface/95 backdrop-blur-md pb-[env(safe-area-inset-bottom)]">
                   <div className="max-w-5xl mx-auto px-4 sm:px-6 py-3 flex items-center justify-between gap-3">
                     <p className="text-sm text-muted min-w-0 truncate">
-                      {selectedJob ? (
-                        <><span className="text-ink font-medium">{selectedJob.title}</span><span className="hidden sm:inline"> · {selectedJob.company}</span></>
-                      ) : "Select a job to tailor your resume"}
+                      {selectedJobs.length
+                        ? <><span className="text-ink font-medium">{selectedJobs.length} job{selectedJobs.length > 1 ? "s" : ""} selected</span><span className="hidden sm:inline"> (max {MAX_SELECTED})</span></>
+                        : "Select the jobs you want to apply for"}
                     </p>
-                    <Button onClick={() => goTo("gaps")} className="shrink-0">
-                      Continue <ArrowRight className="w-4 h-4" />
-                    </Button>
+                    <div className="flex gap-2 shrink-0">
+                      <Button variant="secondary" onClick={() => goTo("gaps")} className="hidden sm:inline-flex">Check skill gaps</Button>
+                      <Button onClick={() => goTo("prepare")} disabled={!selectedJobs.length}>
+                        Tailor resumes <ArrowRight className="w-4 h-4" />
+                      </Button>
+                    </div>
                   </div>
                 </div>
               )}
             </div>
           )}
 
-          {/* ─── Step 3: Skill gaps ─── */}
-          {step === "gaps" && (
+          {/* ─── Step 3              )}
+            </div>
+          )}
+
+          {/* ─── Step 3: Skill gaps (optional) ─── */}
+          {step === "gaps" && profile && (
             <div>
               <PageHeader
-                eyebrow="Step 3"
+                eyebrow="Step 3 · optional"
                 title="Close your skill gaps"
-                description={<>What stands between your profile and <span className="text-ink font-medium">{targetRole || "your target role"}</span> roles in Singapore.</>}
+                description={<>How your skills compare with what Singapore&apos;s Skills Framework says a <span className="text-ink font-medium">{targetRole || profile.title}</span> needs.</>}
+                action={
+                  <Button variant="secondary" size="sm" onClick={() => goTo("prepare")}>
+                    {gapAnalysis ? "Continue" : "Skip"} to tailoring <ArrowRight className="w-4 h-4" />
+                  </Button>
+                }
               />
-
-              {!gapAnalysis ? (
-                <EmptyState
-                  icon={<Target className="w-6 h-6" />}
-                  title="Analyse the market for your target role"
-                  description="We compare your skills against current listings and suggest SkillsFuture-eligible courses."
-                  action={
-                    <div>
-                      <Button size="lg" onClick={handleGapAnalysis} loading={busy === "gaps"} disabled={busy !== null} icon={<Target className="w-4 h-4" />}>
-                        {busy === "gaps" ? "Analysing…" : "Run gap analysis"}
-                      </Button>
-                      <SlowNote show={busy === "gaps"} />
-                    </div>
-                  }
-                />
-              ) : (
-                <div className="space-y-6">
-                  {gapAnalysis.salary_expectation && (
-                    <Card>
-                      <CardHeader icon={<Wallet className="w-[18px] h-[18px]" />} title="Expected salary" subtitle="Monthly, Singapore market" />
-                      <div className="grid grid-cols-3 gap-px bg-line border-t border-line rounded-b-xl overflow-hidden">
-                        {[
-                          { label: "Low", value: gapAnalysis.salary_expectation.min },
-                          { label: "Median", value: gapAnalysis.salary_expectation.median, highlight: true },
-                          { label: "High", value: gapAnalysis.salary_expectation.max },
-                        ].map(({ label, value, highlight }) => (
-                          <div key={label} className="bg-surface px-3 py-4 sm:px-6 sm:py-5">
-                            <p className="text-xs text-muted">{label}</p>
-                            <p className={`mt-1 text-lg sm:text-2xl font-semibold tabular-nums ${highlight ? "text-brand" : "text-ink"}`}>
-                              {money(value) || "—"}
-                            </p>
-                          </div>
-                        ))}
-                      </div>
-                    </Card>
-                  )}
-
-                  <div className="grid gap-6 lg:grid-cols-2">
-                    <Card>
-                      <CardHeader icon={<Target className="w-[18px] h-[18px]" />} title="Missing skills" subtitle="Ranked by how often employers ask for them" />
-                      <ul className="divide-y divide-line border-t border-line">
-                        {gapAnalysis.missing_skills?.map((skill: any, i: number) => (
-                          <li key={i} className="flex items-center justify-between gap-3 px-5 sm:px-6 py-3">
-                            <div className="flex items-center gap-2 min-w-0">
-                              <span className="text-sm font-medium text-ink truncate">{skill.skill}</span>
-                              <Badge tone={levelTone(skill.urgency)}>{skill.urgency}</Badge>
-                            </div>
-                            {skill.found_in_jobs != null && (
-                              <span className="text-xs text-muted whitespace-nowrap">in {skill.found_in_jobs} jobs</span>
-                            )}
-                          </li>
-                        ))}
-                      </ul>
-                    </Card>
-
-                    <Card>
-                      <CardHeader icon={<BookOpen className="w-[18px] h-[18px]" />} title="Recommended courses" subtitle="SkillsFuture eligible where noted" />
-                      <ul className="divide-y divide-line border-t border-line">
-                        {gapAnalysis.recommended_courses?.map((course: any, i: number) => (
-                          <li key={i} className="px-5 sm:px-6 py-4">
-                            <p className="text-sm font-medium text-ink">{course.name}</p>
-                            <p className="text-sm text-muted">{course.provider}</p>
-                            <div className="flex flex-wrap items-center gap-x-3 gap-y-1 mt-2 text-xs text-muted">
-                              {course.duration && <span>{course.duration}</span>}
-                              {course.estimated_cost != null && <span>{money(course.estimated_cost)}</span>}
-                              {course.skillsfuture_subsidy && <Badge tone="success">{course.skillsfuture_subsidy}</Badge>}
-                            </div>
-                            {course.skills_covered?.length > 0 && (
-                              <div className="flex flex-wrap gap-1.5 mt-2">
-                                {course.skills_covered.map((s: string) => <Badge key={s}>{s}</Badge>)}
-                              </div>
-                            )}
-                          </li>
-                        ))}
-                      </ul>
-                    </Card>
-                  </div>
-
-                  {gapAnalysis.career_path_suggestions?.length > 0 && (
-                    <Card>
-                      <CardHeader icon={<TrendingUp className="w-[18px] h-[18px]" />} title="Career paths to consider" />
-                      <ul className="space-y-2 px-5 sm:px-6 pb-5">
-                        {gapAnalysis.career_path_suggestions.map((s: string, i: number) => <Bullet key={i}>{s}</Bullet>)}
-                      </ul>
-                    </Card>
-                  )}
-
-                  <div className="flex flex-col-reverse gap-3 sm:flex-row sm:justify-between">
-                    <Button variant="secondary" onClick={() => goTo("discover")} icon={<ArrowLeft className="w-4 h-4" />}>
-                      Back to jobs
-                    </Button>
-                    <Button onClick={() => goTo("prepare")}>
-                      Tailor my resume <ArrowRight className="w-4 h-4" />
-                    </Button>
-                  </div>
-                </div>
-              )}
+              <SkillGaps
+                profile={profile}
+                targetRole={targetRole || profile.title}
+                targetIndustry={targetIndustry}
+                jobs={jobs}
+                result={gapAnalysis}
+                setResult={setGapAnalysis}
+                onContinue={() => goTo("prepare")}
+                onError={setError}
+              />
             </div>
           )}
 
-          {/* ─── Step 4: Tailor resume ─── */}
-          {step === "prepare" && (
-            !selectedJob ? (
-              <EmptyState
-                icon={<Briefcase className="w-6 h-6" />}
-                title="Pick a job first"
-                description="Choose one of your matched jobs so we can tailor your resume to it."
-                action={<Button onClick={() => goTo("discover")} icon={<ArrowLeft className="w-4 h-4" />}>Back to jobs</Button>}
+          {/* ─── Step 4: Tailor resumes ─── */}
+          {step === "prepare" && profile && (
+            <div>
+              <PageHeader
+                eyebrow="Step 4"
+                title="Tailor your resumes"
+                description="One resume per job, written to pass ATS screening. Edit anything, then download."
+                action={
+                  <Button variant="ghost" size="sm" onClick={() => goTo("discover")} icon={<ArrowLeft className="w-4 h-4" />}>
+                    Change jobs
+                  </Button>
+                }
               />
-            ) : (
-              <div>
-                <PageHeader
-                  eyebrow="Step 4"
-                  title="Tailor your resume"
-                  description={<>Optimised for <span className="text-ink font-medium">{selectedJob.title}</span> at <span className="text-ink font-medium">{selectedJob.company}</span></>}
-                  action={
-                    <Button variant="ghost" size="sm" onClick={() => goTo("discover")} icon={<ArrowLeft className="w-4 h-4" />}>
-                      Choose another job
-                    </Button>
-                  }
-                />
-
-                {!resumeRewrite ? (
-                  <EmptyState
-                    icon={<FileText className="w-6 h-6" />}
-                    title="Rewrite your resume for this role"
-                    description="We'll rewrite your summary and achievements around the job's requirements and add the keywords applicant tracking systems look for."
-                    action={
-                      <div>
-                        <Button size="lg" onClick={handleResumeRewrite} loading={busy === "rewrite"} disabled={busy !== null} icon={<Sparkles className="w-4 h-4" />}>
-                          {busy === "rewrite" ? "Rewriting…" : "Tailor my resume"}
-                        </Button>
-                        <SlowNote show={busy === "rewrite"} />
-                      </div>
-                    }
-                  />
-                ) : (
-                  <div className="space-y-6">
-                    <Card className="p-5 sm:p-6">
-                      <div className="flex items-center gap-5">
-                        <ScoreRing score={resumeRewrite.ats_score} size={72} />
-                        <div className="min-w-0">
-                          <h3 className="text-[15px] font-semibold text-ink">ATS match score</h3>
-                          <p className="text-sm text-muted mt-0.5">How well the tailored resume lines up with this job&apos;s keywords and requirements.</p>
-                        </div>
-                      </div>
-                      {resumeRewrite.keywords_added?.length > 0 && (
-                        <div className="mt-5 pt-5 border-t border-line">
-                          <p className="text-xs font-medium uppercase tracking-wider text-muted mb-2">Keywords added</p>
-                          <div className="flex flex-wrap gap-1.5">
-                            {resumeRewrite.keywords_added.map((kw: string) => <Badge key={kw} tone="brand">{kw}</Badge>)}
-                          </div>
-                        </div>
-                      )}
-                    </Card>
-
-                    <div className="grid gap-4 md:grid-cols-2">
-                      <Card className="p-5 sm:p-6">
-                        <p className="text-xs font-medium uppercase tracking-wider text-muted mb-2">Original summary</p>
-                        <p className="text-sm text-muted leading-relaxed">{resumeRewrite.original_summary}</p>
-                      </Card>
-                      <Card className="p-5 sm:p-6 border-brand/40">
-                        <p className="text-xs font-medium uppercase tracking-wider text-brand mb-2">Tailored summary</p>
-                        <p className="text-sm text-ink leading-relaxed">{resumeRewrite.rewritten_summary}</p>
-                      </Card>
-                    </div>
-
-                    {resumeRewrite.optimized_bullets?.length > 0 && (
-                      <Card>
-                        <CardHeader icon={<Sparkles className="w-[18px] h-[18px]" />} title="Rewritten achievements" />
-                        <ul className="space-y-3 px-5 sm:px-6 pb-6">
-                          {resumeRewrite.optimized_bullets.map((b: string, i: number) => <Bullet key={i}>{b}</Bullet>)}
-                        </ul>
-                      </Card>
-                    )}
-
-                    <Card className="p-5 sm:p-6">
-                      <h3 className="text-[15px] font-semibold text-ink">Next steps</h3>
-                      <p className="text-sm text-muted mt-0.5 mb-4">Download your tailored resume, apply, or get ready for the interview.</p>
-                      <div className="grid gap-3 sm:grid-cols-3">
-                        <Button variant="secondary" onClick={handleDownloadResume} loading={busy === "download"} disabled={busy !== null} icon={<Download className="w-4 h-4" />}>
-                          {busy === "download" ? "Generating…" : "Download .docx"}
-                        </Button>
-                        <Button variant="secondary" onClick={handleApply} loading={busy === "apply"} disabled={busy !== null || !selectedJob.job_url} icon={<Send className="w-4 h-4" />}>
-                          {busy === "apply" ? "Applying…" : "Auto-apply"}
-                        </Button>
-                        <Button onClick={() => goTo("interview")}>
-                          Interview prep <ArrowRight className="w-4 h-4" />
-                        </Button>
-                      </div>
-
-                      {applyResult && (
-                        <div className={`mt-5 rounded-lg border p-4 ${applyResult.success ? "border-success/30 bg-success-soft" : "border-warning/30 bg-warning-soft"}`}>
-                          <p className={`flex items-center gap-2 text-sm font-semibold ${applyResult.success ? "text-success" : "text-warning"}`}>
-                            {applyResult.success ? <CheckCircle2 className="w-4 h-4" /> : <AlertTriangle className="w-4 h-4" />}
-                            {applyResult.success ? "Application submitted" : "Application needs your attention"}
-                          </p>
-                          <ul className="mt-2 space-y-1 text-sm text-text">
-                            {applyResult.steps?.map((s: string, i: number) => <li key={i} className="break-words">• {s}</li>)}
-                            {applyResult.errors?.map((e: string, i: number) => <li key={`e${i}`} className="text-danger break-words">• {e}</li>)}
-                          </ul>
-                        </div>
-                      )}
-                    </Card>
-                  </div>
-                )}
-              </div>
-            )
+              <TailorWorkspace
+                jobs={selectedJobs}
+                profile={profile}
+                tailored={tailored}
+                setTailored={setTailored}
+                template={template}
+                setTemplate={setTemplate}
+                activeJobId={selectedJob?.uuid ?? null}
+                setActiveJobId={(id) => { setActiveJobId(id); setApplyResult(null); }}
+                onInterview={() => goTo("interview")}
+                onApply={(job, resume, t) => handleApply(job, resume, t)}
+                applying={busy === "apply"}
+                applyResult={applyResult}
+                onBackToJobs={() => goTo("discover")}
+                onError={setError}
+              />
+            </div>
           )}
 
           {/* ─── Step 5: Interview ─── */}
@@ -1061,6 +985,16 @@ export default function Home() {
                   eyebrow="Step 5"
                   title="Prepare for the interview"
                   description={<>For <span className="text-ink font-medium">{selectedJob.title}</span> at <span className="text-ink font-medium">{selectedJob.company}</span></>}
+                  action={selectedJobs.length > 1 ? (
+                    <select
+                      aria-label="Choose a job"
+                      value={selectedJob.uuid}
+                      onChange={(e) => setActiveJobId(e.target.value)}
+                      className={`${inputClass} h-9 text-sm max-w-[260px]`}
+                    >
+                      {selectedJobs.map(j => <option key={j.uuid} value={j.uuid}>{j.title} · {j.company}</option>)}
+                    </select>
+                  ) : undefined}
                 />
 
                 {!interviewPrep ? (
@@ -1164,7 +1098,7 @@ export default function Home() {
       <footer className={`border-t border-line ${step === "discover" && jobs.length > 0 ? "pb-20" : ""}`}>
         <div className="max-w-5xl mx-auto px-4 sm:px-6 py-6 flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between text-xs text-muted">
           <p>© {new Date().getFullYear()} CareerFlow SG</p>
-          <p>Job data from MyCareersFuture · AI by GPT-OSS 120B via Groq</p>
+          <p>Job data from MyCareersFuture · Powered by the LLM of your choice</p>
         </div>
       </footer>
     </div>

@@ -19,7 +19,8 @@ async def scrape_jobstreet(
 ) -> list[JobListing]:
     """Scrape JobStreet Singapore."""
     jobs = []
-    url = f"https://www.jobstreet.com.sg/en/jobs/search/{query.replace(' ', '-')}"
+    slug = re.sub(r"[^a-z0-9]+", "-", query.lower()).strip("-")
+    url = f"https://sg.jobstreet.com/{slug}-jobs"
 
     try:
         async with async_playwright() as p:
@@ -33,51 +34,54 @@ async def scrape_jobstreet(
             await page.goto(url, wait_until="domcontentloaded", timeout=30000)
             await page.wait_for_timeout(3000)  # Wait for JS rendering
 
-            # Try to extract job cards
-            job_cards = await page.query_selector_all('[data-testid="job-card"], .job-card, [class*="job-card"], [class*="JobCard"]')
+            # Job cards use stable data-automation attributes (checked Nov 2026)
+            job_cards = await page.query_selector_all('article[data-automation="normalJob"], article[data-card-type="JobCard"]')
+
+            async def text_of(card, selector: str) -> str:
+                el = await card.query_selector(selector)
+                return (await el.inner_text()).strip() if el else ""
 
             for card in job_cards[:limit]:
                 try:
-                    title_el = await card.query_selector('h3 a, [class*="title"], a[class*="job"]')
-                    company_el = await card.query_selector('[class*="company"], span[class*="company"]')
-                    location_el = await card.query_selector('[class*="location"], span[class*="location"]')
-                    salary_el = await card.query_selector('[class*="salary"], span[class*="salary"]')
+                    title = await text_of(card, '[data-automation="jobTitle"]')
+                    company = await text_of(card, '[data-automation="jobCompany"]')
+                    location = await text_of(card, '[data-automation="jobLocation"]')
+                    salary_text = await text_of(card, '[data-automation="jobSalary"]')
 
-                    title = (await title_el.inner_text()) if title_el else ""
-                    company = (await company_el.inner_text()) if company_el else ""
-                    location = (await location_el.inner_text()) if location_el else ""
-                    salary_text = (await salary_el.inner_text()) if salary_el else ""
-
-                    # Parse salary
+                    # Parse salary such as "$3,800 – $4,500 per month"
                     salary_min, salary_max = None, None
-                    if salary_text:
-                        nums = re.findall(r'\d+', salary_text)
-                        if len(nums) >= 2:
-                            salary_min, salary_max = int(nums[0]), int(nums[1])
-                        elif len(nums) == 1:
-                            salary_min = int(nums[0])
+                    nums = [int(n.replace(",", "")) for n in re.findall(r"\d[\d,]*", salary_text)]
+                    if len(nums) >= 2:
+                        salary_min, salary_max = nums[0], nums[1]
+                    elif len(nums) == 1:
+                        salary_min = nums[0]
 
                     # Get job link
-                    link_el = await card.query_selector('a[href*="/job/"]')
+                    link_el = await card.query_selector('a[data-automation="jobTitle"], a[href*="/job/"]')
                     job_url = ""
                     if link_el:
                         href = await link_el.get_attribute("href")
                         if href:
-                            job_url = href if href.startswith("http") else f"https://www.jobstreet.com.sg{href}"
+                            job_url = href if href.startswith("http") else f"https://sg.jobstreet.com{href.split('#')[0]}"
+                    job_id = re.search(r"/job/(\d+)", job_url)
+
+                    # "West Coast, West Region" -> district / region
+                    district, _, region = location.partition(",")
 
                     if title and company:
                         jobs.append(JobListing(
-                            uuid=f"jobstreet_{len(jobs)}_{datetime.now().timestamp()}",
-                            title=title.strip(),
-                            company=company.strip(),
+                            uuid=f"jobstreet_{job_id.group(1) if job_id else len(jobs)}",
+                            source="jobstreet",
+                            title=title,
+                            company=company,
                             salary_min=salary_min,
                             salary_max=salary_max,
                             salary_type="Monthly",
                             skills=[],
                             experience_required=0,
-                            location=location.strip() if location else "Singapore",
-                            district="",
-                            region="",
+                            location=location or "Singapore",
+                            district=district.strip(),
+                            region=region.strip(),
                             employment_type="",
                             position_level="",
                             description="",
@@ -340,6 +344,7 @@ async def scrape_all_portals(
     query: str,
     limit: int = 30,
     sources: Optional[list[str]] = None,
+    mcf_filters: Optional[dict] = None,
 ) -> list[JobListing]:
     """
     Scrape jobs from all available portals.
@@ -379,7 +384,7 @@ async def scrape_all_portals(
         if "mcf" not in sources:
             return []
         try:
-            return [await search_mcf_jobs(query, limit=per_source)]
+            return [await search_mcf_jobs(query, limit=per_source, **(mcf_filters or {}))]
         except Exception as e:
             return [e]
 

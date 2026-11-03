@@ -1,5 +1,5 @@
 {
-  "name": "careerflow-sg-monorepo",
+  "name": "careerflow-sg",
   "private": true,
   "workspaces": [
     "frontend"

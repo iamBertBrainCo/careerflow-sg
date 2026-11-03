@@ -4,6 +4,7 @@ Autonomous multi-agent career workflow engine for Singapore job seekers.
 """
 
 import os
+import re
 import json
 import hmac
 import time
@@ -26,13 +27,16 @@ from playwright.async_api import async_playwright
 
 load_dotenv()
 
-# ─── Configuration ───────────────────────────────────────────────
-# Groq API Configuration (Free & Fast)
-LLM_API_KEY = os.getenv("MODEL_API_KEY", "")
-LLM_BASE_URL = "https://api.groq.com/openai/v1"
+# ─── Configuration (backend/.env, see .env.example) ──────────────
+# Any OpenAI-compatible chat API works: Groq (default), Google Gemini, OpenRouter, Ollama...
+LLM_API_KEY = os.getenv("MODEL_API_KEY", "").strip()
+if LLM_API_KEY.startswith("paste-your-key") or LLM_API_KEY.endswith("-here"):
+    LLM_API_KEY = ""  # still the .env.example placeholder
+LLM_BASE_URL = os.getenv("LLM_BASE_URL", "https://api.groq.com/openai/v1").strip().rstrip("/")
+MODEL_ID = os.getenv("MODEL_ID", "openai/gpt-oss-120b").strip()
 MCF_API_BASE = os.getenv("MCF_API_BASE", "https://api.mycareersfuture.gov.sg/v2")
-# Llama 3.3 70B was retired on Groq; override with MODEL_ID if the default is retired too.
-MODEL_ID = os.getenv("MODEL_ID", "openai/gpt-oss-120b")
+# Local providers (Ollama, LM Studio) need no key
+LLM_IS_LOCAL = any(h in LLM_BASE_URL for h in ("localhost", "127.0.0.1", "[::1]"))
 
 app = FastAPI(
     title="CareerFlow SG",
@@ -75,7 +79,9 @@ async def catch_unhandled_errors(request, call_next):
     try:
         return await call_next(request)
     except Exception as e:
+        import traceback
         print(f"Unhandled error on {request.url.path}: {e!r}")
+        traceback.print_exc()
         return JSONResponse(
             status_code=500,
             content={"detail": "Something went wrong on our side. Please try again."},
@@ -93,6 +99,12 @@ app.add_middleware(
 
 class ProfileData(BaseModel):
     name: str = ""
+    # Contact details, carried into generated resumes and application forms
+    email: str = ""
+    phone: str = ""
+    linkedin: str = ""
+    portfolio: str = ""
+    location: str = ""
     title: str = ""
     summary: str = ""
     skills: list[str] = []
@@ -122,19 +134,12 @@ class JobListing(BaseModel):
     applications: int = 0
     match_score: float = 0.0
     source: str = "mcf"  # mcf, jobstreet, indeed, linkedin, glassdoor
-
-class GapAnalysis(BaseModel):
-    missing_skills: list[dict] = []  # {skill, urgency, courses}
-    recommended_courses: list[dict] = []  # {name, provider, duration, cost, skillsfuture_subsidy}
-    career_path_suggestions: list[str] = []
-    salary_expectation: dict = {}  # {min, max, median, currency}
-
-class ResumeRewrite(BaseModel):
-    original_summary: str = ""
-    rewritten_summary: str = ""
-    optimized_bullets: list[str] = []
-    keywords_added: list[str] = []
-    ats_score: float = 0.0
+    # Why the job was ranked where it was (see matching.py)
+    match_reason: str = ""
+    matched_skills: list[str] = []
+    missing_skills: list[str] = []
+    score_breakdown: dict = {}
+    ai_ranked: bool = False
 
 class InterviewPrep(BaseModel):
     behavioral_questions: list[dict] = []  # {question, why_asked, star_framework_hint}
@@ -160,12 +165,13 @@ async def call_llm(
     tools: Optional[list] = None,
     response_format: Optional[dict] = None,
     max_tokens: int = 8192,
+    temperature: float = 0.7,
 ) -> str:
     """Call the LLM (Groq, OpenAI-compatible chat completions)."""
-    if not LLM_API_KEY:
+    if not LLM_API_KEY and not LLM_IS_LOCAL:
         raise HTTPException(
             status_code=500,
-            detail="LLM API key not configured. Set MODEL_API_KEY in .env",
+            detail="No AI key set up. Open backend/.env, paste your key after MODEL_API_KEY=, then restart the backend.",
         )
 
     messages = [
@@ -178,7 +184,7 @@ async def call_llm(
             "model": MODEL_ID,
             "messages": messages,
             "max_tokens": max_tokens,
-            "temperature": 0.7,
+            "temperature": temperature,
         }
         # GPT-OSS is a reasoning model: its thinking counts against max_tokens and can
         # leave an empty answer on big prompts (e.g. scoring 30 jobs). Keep it brief.
@@ -195,7 +201,7 @@ async def call_llm(
             response = await client.post(
                 f"{LLM_BASE_URL}/chat/completions",
                 headers={
-                    "Authorization": f"Bearer {LLM_API_KEY}",
+                    "Authorization": f"Bearer {LLM_API_KEY or 'local'}",
                     "Content-Type": "application/json",
                 },
                 json=payload,
@@ -205,6 +211,11 @@ async def call_llm(
                 continue
             if response.status_code == 400 and "json_validate_failed" in response.text and attempt < 1:
                 continue
+            # Some providers don't support JSON mode or reasoning_effort; the prompt asks for JSON anyway
+            if response.status_code == 400 and attempt < 2 and ("response_format" in response.text or "reasoning" in response.text):
+                payload.pop("response_format", None)
+                payload.pop("reasoning_effort", None)
+                continue
             break
 
         if response.status_code == 429:
@@ -212,6 +223,10 @@ async def call_llm(
                 status_code=429,
                 detail="The AI service is busy right now. Please wait a minute and try again.",
             )
+        if response.status_code in (401, 403):
+            raise HTTPException(status_code=500, detail="Your AI provider rejected the key. Check MODEL_API_KEY in backend/.env, then restart the backend.")
+        if response.status_code == 404 or "model_not_found" in response.text or "does not exist" in response.text:
+            raise HTTPException(status_code=500, detail=f"The model \"{MODEL_ID}\" wasn't found at {LLM_BASE_URL}. Check MODEL_ID in backend/.env.")
         if response.status_code != 200:
             print(f"LLM API error {response.status_code}: {response.text[:500]}")
             # 500, not 502: the frontend retries 502-504 as "server waking up"
@@ -227,6 +242,7 @@ async def call_llm_structured(
     system_prompt: str,
     user_prompt: str,
     schema: dict,
+    temperature: float = 0.4,
 ) -> dict:
     """Call the LLM and parse a structured JSON response."""
     # Not every Groq model supports `json_schema` output, so use JSON mode and
@@ -239,6 +255,7 @@ async def call_llm_structured(
         system_prompt=system_prompt,
         user_prompt=user_prompt,
         response_format={"type": "json_object"},
+        temperature=temperature,
     )
     # Parse JSON from response (handle markdown code blocks)
     text = text.strip()
@@ -254,24 +271,33 @@ async def search_mcf_jobs(
     query: str,
     limit: int = 50,
     salary_min: Optional[int] = None,
-    position_level: Optional[str] = None,
+    employment_type: Optional[str] = None,
 ) -> list[JobListing]:
-    """Search jobs from MyCareersFuture public API."""
-    params = {
-        "search": query,
-        "limit": min(limit, 100),
-        "page": 0,
-    }
+    """Search MyCareersFuture's public API, fetching pages of 100 in parallel."""
+    per_page = min(limit, 100)
+    pages = max(1, -(-limit // per_page))  # ceiling division
+    base_params = {"search": query, "limit": per_page}
     if salary_min:
-        params["salary"] = salary_min
+        base_params["salary"] = salary_min  # jobs whose range reaches this amount
+    if employment_type:
+        base_params["employmentTypes"] = employment_type
 
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        response = await client.get(f"{MCF_API_BASE}/jobs", params=params)
+    async with httpx.AsyncClient(timeout=45.0) as client:
+        responses = await asyncio.gather(*[
+            client.get(f"{MCF_API_BASE}/jobs", params={**base_params, "page": page})
+            for page in range(pages)
+        ])
+    results = []
+    for response in responses:
         response.raise_for_status()
-        data = response.json()
+        results.extend(response.json().get("results", []))
 
     jobs = []
-    for job in data.get("results", [])[:limit]:
+    seen = set()
+    for job in results[:limit]:
+        if job.get("uuid") in seen:
+            continue
+        seen.add(job.get("uuid"))
         company = job.get("postedCompany", {})
         address = job.get("address", {})
         salary = job.get("salary", {})
@@ -313,12 +339,19 @@ async def agent_parse_profile(resume_text: str) -> ProfileData:
     system_prompt = """You are an expert career analyst specializing in the Singapore job market.
 Extract structured profile data from the resume. Be precise about skills, experience levels,
 and education. Identify both hard skills (technologies, tools) and soft skills.
+Copy contact details (email, phone, LinkedIn URL, portfolio/website URL, location) exactly
+as written in the resume; use an empty string for any that are not present. Never invent them.
 Return valid JSON matching the schema."""
 
     schema = {
         "type": "object",
         "properties": {
             "name": {"type": "string"},
+            "email": {"type": "string"},
+            "phone": {"type": "string"},
+            "linkedin": {"type": "string"},
+            "portfolio": {"type": "string"},
+            "location": {"type": "string"},
             "title": {"type": "string"},
             "summary": {"type": "string"},
             "skills": {"type": "array", "items": {"type": "string"}},
@@ -341,201 +374,111 @@ Return valid JSON matching the schema."""
         "required": ["name", "title", "summary", "skills", "experience_years"],
     }
 
-    result = await call_llm_structured(system_prompt, resume_text, schema)
-    return ProfileData(**result)
+    result = await call_llm_structured(system_prompt, resume_text, schema, temperature=0)
+    # Drop nulls so model defaults apply instead of failing validation
+    return ProfileData(**{k: v for k, v in result.items() if v is not None})
 
 async def agent_match_jobs(
     profile: ProfileData,
     jobs: list[JobListing],
     target_role: str = "",
     target_industry: str = "",
+    min_salary: Optional[int] = None,
+    ai_top_n: int = 15,
 ) -> list[JobListing]:
-    """Score and rank jobs based on profile match."""
-    system_prompt = f"""You are a job matching engine for the Singapore job market.
-Target Role: {target_role}
-Target Industry: {target_industry}
+    """
+    Rank jobs in two steps:
+      1. matching.rank_jobs scores every job in code (title, skills, experience, salary).
+      2. The AI re-reads only the top `ai_top_n`, re-scores them and explains each one.
+    Final score for re-ranked jobs = average of the code score and the AI score.
+    """
+    from matching import rank_jobs
 
-Given a candidate profile and a list of jobs, score each job on a 0-100 scale based on:
-- Skills match (35%): How many required skills does the candidate have?
-- Experience match (25%): Does their experience level fit?
-- Industry Fit (20%): Does the job align with the target industry and role?
-- Career progression (15%): Is this a step up, lateral, or step down?
-- Location & logistics (5%): Is the location reasonable?
+    jobs = rank_jobs(profile, jobs, target_role=target_role, min_salary=min_salary)
+    top = jobs[:ai_top_n]
+    if not top:
+        return jobs
 
-Return a JSON object with each job's id and its match score."""
+    system_prompt = f"""You are a careful recruiter for the Singapore job market.
+Target role: {target_role or profile.title}
+Target industry: {target_industry or "any"}
 
-    # Compact JSON and short numeric ids (not 32-char UUIDs) keep this call well
-    # under the free Groq tier's tokens-per-minute limit.
+For each job, judge how well this candidate fits, 0-100, considering: skills they have that
+the job needs, experience level, whether the role is a sensible next step, and industry fit.
+Be honest: a poor fit should score low. For each job give a one-sentence reason (max 25 words)
+written to the candidate ("You..."), and up to 3 important requirements they appear to lack."""
+
     profile_summary = json.dumps({
-        "skills": profile.skills,
-        "experience_years": profile.experience_years,
         "title": profile.title,
-        "summary": profile.summary,
+        "experience_years": profile.experience_years,
+        "skills": profile.skills[:25],
+        "summary": profile.summary[:600],
     }, separators=(",", ":"))
 
+    # Compact JSON and short numeric ids keep this under free-tier token limits
     jobs_summary = json.dumps([
         {
             "id": i,
             "title": j.title,
             "company": j.company,
-            "skills": j.skills[:12],
-            "exp": j.experience_required,
+            "min_years": j.experience_required,
             "level": j.position_level,
+            "salary": f"{j.salary_min or '?'}-{j.salary_max or '?'}",
+            "skills": j.skills[:12],
+            "about": j.description[:450],
         }
-        for i, j in enumerate(jobs)
+        for i, j in enumerate(top)
     ], separators=(",", ":"))
 
-    user_prompt = f"""Profile:\n{profile_summary}\n\nJobs:\n{jobs_summary}\n\nScore every job and return JSON: {{"scores": [{{"id": 0, "match_score": 0-100}}]}}"""
+    user_prompt = (
+        f"Candidate:\n{profile_summary}\n\nJobs:\n{jobs_summary}\n\n"
+        'Return JSON: {"jobs": [{"id": 0, "match_score": 0-100, "reason": "...", "lacking": ["..."]}]}'
+    )
 
     schema = {
         "type": "object",
         "properties": {
-            "scores": {
+            "jobs": {
                 "type": "array",
                 "items": {
                     "type": "object",
                     "properties": {
                         "id": {"type": "integer"},
                         "match_score": {"type": "number"},
+                        "reason": {"type": "string"},
+                        "lacking": {"type": "array", "items": {"type": "string"}},
                     },
-                    "required": ["id", "match_score"],
+                    "required": ["id", "match_score", "reason"],
                 },
             },
         },
-        "required": ["scores"],
+        "required": ["jobs"],
     }
 
-    result = await call_llm_structured(system_prompt, user_prompt, schema)
+    try:
+        result = await call_llm_structured(system_prompt, user_prompt, schema, temperature=0)
+    except HTTPException as e:
+        # The code ranking still stands on its own if the AI is busy or down
+        print(f"AI re-rank skipped: {e.detail}")
+        return jobs
 
-    # Apply scores to jobs
-    for s in result.get("scores", []):
+    for item in result.get("jobs", []):
         try:
-            jobs[int(s["id"])].match_score = float(s["match_score"])
+            job = top[int(item["id"])]
+            ai_score = max(0.0, min(100.0, float(item["match_score"])))
         except (KeyError, IndexError, TypeError, ValueError):
             continue
+        job.score_breakdown["code"] = job.match_score
+        job.score_breakdown["ai"] = round(ai_score)
+        job.match_score = round((job.match_score + ai_score) / 2, 1)
+        job.match_reason = str(item.get("reason", ""))[:300]
+        lacking = [str(x) for x in item.get("lacking", []) if x][:3]
+        if lacking:
+            job.missing_skills = lacking
+        job.ai_ranked = True
 
-    # Sort by match score descending
-    jobs.sort(key=lambda j: j.match_score, reverse=True)
+    jobs.sort(key=lambda j: (j.ai_ranked, j.match_score), reverse=True)
     return jobs
-
-async def agent_gap_analysis(
-    profile: ProfileData,
-    top_jobs: list[JobListing],
-    target_role: str = "",
-    target_industry: str = "",
-) -> GapAnalysis:
-    """Analyze skill gaps and recommend upskilling paths."""
-    system_prompt = f"""You are a career development advisor for Singapore.
-Target Role: {target_role}
-Target Industry: {target_industry}
-
-Analyze the gap between the candidate's profile and their target roles in this industry.
-Identify missing skills, recommend specific SkillsFuture-eligible courses,
-and suggest career path options. Be specific about course names, providers,
-and expected costs with SkillsFuture subsidies."""
-
-    profile_summary = json.dumps({
-        "skills": profile.skills,
-        "experience_years": profile.experience_years,
-        "title": profile.title,
-    }, separators=(",", ":"))
-
-    jobs_summary = json.dumps([
-        {
-            "title": j.title,
-            "company": j.company,
-            "skills": j.skills[:15],
-            "salary_min": j.salary_min,
-            "salary_max": j.salary_max,
-        }
-        for j in top_jobs[:10]
-    ], separators=(",", ":"))
-
-    user_prompt = f"""Candidate Profile:\n{profile_summary}\n\nTop Matching Jobs:\n{jobs_summary}\n\nAnalyze gaps and recommend specific upskilling paths for Singapore."""
-
-    schema = {
-        "type": "object",
-        "properties": {
-            "missing_skills": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "skill": {"type": "string"},
-                        "urgency": {"type": "string", "enum": ["high", "medium", "low"]},
-                        "found_in_jobs": {"type": "integer"},
-                        "courses": {"type": "array", "items": {"type": "string"}},
-                    },
-                },
-            },
-            "recommended_courses": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "name": {"type": "string"},
-                        "provider": {"type": "string"},
-                        "duration": {"type": "string"},
-                        "estimated_cost": {"type": "number"},
-                        "skillsfuture_subsidy": {"type": "string"},
-                        "skills_covered": {"type": "array", "items": {"type": "string"}},
-                    },
-                },
-            },
-            "career_path_suggestions": {"type": "array", "items": {"type": "string"}},
-            "salary_expectation": {
-                "type": "object",
-                "properties": {
-                    "min": {"type": "number"},
-                    "max": {"type": "number"},
-                    "median": {"type": "number"},
-                    "currency": {"type": "string"},
-                },
-            },
-        },
-        "required": ["missing_skills", "recommended_courses"],
-    }
-
-    result = await call_llm_structured(system_prompt, user_prompt, schema)
-    return GapAnalysis(**result)
-
-async def agent_rewrite_resume(
-    profile: ProfileData,
-    target_job: JobListing,
-) -> ResumeRewrite:
-    """Rewrite resume summary and bullets for a specific target job."""
-    system_prompt = """You are an expert resume writer specializing in Singapore's job market.
-Rewrite the candidate's resume summary and key achievements to match the target job.
-Focus on: ATS optimization (keywords), quantifiable achievements, relevant skills,
-and Singapore market expectations. Keep it honest — never fabricate experience."""
-
-    profile_text = f"""Name: {profile.name}
-Current Title: {profile.title}
-Summary: {profile.summary}
-Skills: {', '.join(profile.skills)}
-Experience: {profile.experience_years} years
-Work History: {json.dumps(profile.work_history, indent=2)}"""
-
-    job_text = f"""Job: {target_job.title} at {target_job.company}
-Required Skills: {', '.join(target_job.skills)}
-Description: {target_job.description[:2000]}"""
-
-    user_prompt = f"""Candidate Profile:\n{profile_text}\n\nTarget Job:\n{job_text}\n\nRewrite the resume to maximize match with this job."""
-
-    schema = {
-        "type": "object",
-        "properties": {
-            "original_summary": {"type": "string"},
-            "rewritten_summary": {"type": "string"},
-            "optimized_bullets": {"type": "array", "items": {"type": "string"}},
-            "keywords_added": {"type": "array", "items": {"type": "string"}},
-            "ats_score": {"type": "number"},
-        },
-        "required": ["rewritten_summary", "optimized_bullets"],
-    }
-
-    result = await call_llm_structured(system_prompt, user_prompt, schema)
-    return ResumeRewrite(**result)
 
 async def agent_interview_prep(
     profile: ProfileData,
@@ -606,8 +549,10 @@ async def health():
     return {
         "status": "ok",
         "service": "CareerFlow SG",
-        "llm_configured": bool(LLM_API_KEY),
+        "llm_configured": bool(LLM_API_KEY) or LLM_IS_LOCAL,
         "model": MODEL_ID,
+        "provider": LLM_BASE_URL.split("//")[-1].split("/")[0],
+        "skills_framework": (Path(__file__).parent / "data" / "skills_framework.json.gz").exists(),
     }
 
 @app.post("/api/profile/parse", response_model=ProfileData)
@@ -669,380 +614,513 @@ async def search_jobs(
     
     return {"total": len(jobs), "jobs": [j.model_dump() for j in jobs]}
 
+async def resolve_profile(profile_json: Optional[str], resume_text: Optional[str]) -> ProfileData:
+    """The candidate: the structured profile the browser holds, else parsed from resume text."""
+    if profile_json:
+        try:
+            return ProfileData.model_validate_json(profile_json)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid profile data; please re-upload your resume.")
+    if resume_text and resume_text.strip():
+        return await agent_parse_profile(resume_text)
+    raise HTTPException(status_code=400, detail="No profile: please upload your resume first.")
+
+def _optional_int(value: Optional[str]) -> Optional[int]:
+    try:
+        return int(value) if value not in (None, "") else None
+    except ValueError:
+        return None
+
+async def find_jobs(query: str, limit: int, sources: str, min_salary: Optional[int], employment_type: str) -> list[JobListing]:
+    source_list = [s.strip() for s in sources.split(",") if s.strip()] if sources else ["mcf"]
+    filters = {"salary_min": min_salary, "employment_type": employment_type or None}
+    if source_list == ["mcf"]:
+        return await search_mcf_jobs(query, limit=limit, **filters)
+    from scrapers import scrape_all_portals
+    return await scrape_all_portals(query, limit=limit, sources=source_list, mcf_filters=filters)
+
 @app.post("/api/jobs/match", response_model=list[JobListing])
 async def match_jobs(
-    query: str = Form("software engineer"),
-    limit: int = Form(30),
-    resume_text: str = Form(...),
+    query: str = Form(""),
+    limit: int = Form(200),
+    resume_text: str = Form(None),
+    profile_json: str = Form(None),
     target_role: str = Form(""),
     target_industry: str = Form(""),
     sources: str = Form("mcf"),  # comma-separated portal sources
+    min_salary: str = Form(""),
+    employment_type: str = Form(""),
 ):
-    """Search jobs and score them against the candidate's profile."""
-    # Parse profile first
-    profile = await agent_parse_profile(resume_text)
+    """Search jobs, rank them all in code, then have the AI re-rank and explain the best."""
+    profile = await resolve_profile(profile_json, resume_text)
+    query = (query or target_role or profile.title).strip()
+    if not query:
+        raise HTTPException(status_code=400, detail="Enter a target role to search for.")
+    salary = _optional_int(min_salary)
+    jobs = await find_jobs(query, min(max(limit, 10), 200), sources, salary, employment_type)
+    return await agent_match_jobs(profile, jobs, target_role=target_role or query,
+                                  target_industry=target_industry, min_salary=salary)
 
-    # Search jobs (single or multi-portal)
-    source_list = [s.strip() for s in sources.split(",")] if sources else ["mcf"]
-    if "mcf" in source_list and len(source_list) == 1:
-        jobs = await search_mcf_jobs(query, limit=limit)
-    else:
-        from scrapers import scrape_all_portals
-        jobs = await scrape_all_portals(query, limit=limit, sources=source_list)
-
-    # Score and rank
-    matched = await agent_match_jobs(profile, jobs, target_role=target_role, target_industry=target_industry)
-
-    return matched
-
-@app.post("/api/gap-analysis")
-async def gap_analysis(
-    query: str = Form("software engineer"),
-    resume_text: str = Form(...),
-    target_role: str = Form(""),
-    target_industry: str = Form(""),
-    sources: str = Form("mcf"),
-):
-    """Analyze skill gaps and recommend upskilling paths."""
-    profile = await agent_parse_profile(resume_text)
-    
-    source_list = [s.strip() for s in sources.split(",")] if sources else ["mcf"]
-    if "mcf" in source_list and len(source_list) == 1:
-        jobs = await search_mcf_jobs(query, limit=30)
-    else:
-        from scrapers import scrape_all_portals
-        jobs = await scrape_all_portals(query, limit=30, sources=source_list)
-    
-    # Search results are already relevance-ordered; skipping a second scoring pass
-    # halves the LLM tokens this endpoint needs (free tier: 8k tokens/minute).
-    gaps = await agent_gap_analysis(profile, jobs, target_role=target_role, target_industry=target_industry)
-    return gaps.model_dump()
-
-@app.post("/api/resume/rewrite")
-async def rewrite_resume(
-    resume_text: str = Form(...),
-    job_uuid: str = Form(...),
-):
-    """Rewrite resume for a specific target job."""
-    profile = await agent_parse_profile(resume_text)
-
-    # Fetch the specific job
+async def resolve_job(job_uuid: Optional[str], job_json: Optional[str]) -> Optional[JobListing]:
+    """The job to work on: as sent by the frontend (any portal), else fetched from MCF by uuid."""
+    if job_json:
+        try:
+            return JobListing.model_validate_json(job_json)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid job data")
+    if not job_uuid:
+        return None
+    if not re.fullmatch(r"[0-9a-f]{32}", job_uuid):
+        raise HTTPException(status_code=400, detail="This job isn't from MyCareersFuture; please search again.")
     async with httpx.AsyncClient(timeout=30.0) as client:
         response = await client.get(f"{MCF_API_BASE}/jobs/{job_uuid}")
-        response.raise_for_status()
-        job_data = response.json()
-
-    job = JobListing(
+    if response.status_code == 404:
+        raise HTTPException(status_code=404, detail="This job listing is no longer available.")
+    response.raise_for_status()
+    job_data = response.json()
+    salary = job_data.get("salary") or {}
+    return JobListing(
         uuid=job_data.get("uuid", ""),
         title=job_data.get("title", ""),
-        company=job_data.get("postedCompany", {}).get("name", ""),
-        salary_min=job_data.get("salary", {}).get("minimum"),
-        salary_max=job_data.get("salary", {}).get("maximum"),
-        salary_type=job_data.get("salary", {}).get("type", {}).get("salaryType", "Monthly"),
-        skills=[s.get("skill", "") for s in job_data.get("skills", [])],
+        company=(job_data.get("postedCompany") or {}).get("name", ""),
+        salary_min=salary.get("minimum"),
+        salary_max=salary.get("maximum"),
+        salary_type=(salary.get("type") or {}).get("salaryType", "Monthly"),
+        skills=[sk.get("skill", "") for sk in job_data.get("skills", [])],
         experience_required=job_data.get("minimumYearsExperience", 0) or 0,
+        position_level=", ".join(pl.get("position", "") for pl in job_data.get("positionLevels", [])),
         description=job_data.get("description", ""),
+        job_url=(job_data.get("metadata") or {}).get("jobDetailsUrl", ""),
     )
-
-    rewrite = await agent_rewrite_resume(profile, job)
-    return rewrite.model_dump()
 
 @app.post("/api/interview/prep")
 async def interview_prep(
-    resume_text: str = Form(...),
-    job_uuid: str = Form(...),
+    resume_text: str = Form(None),
+    profile_json: str = Form(None),
+    job_uuid: str = Form(None),
+    job_json: str = Form(None),
 ):
     """Generate interview preparation materials for a specific job."""
-    profile = await agent_parse_profile(resume_text)
-
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        response = await client.get(f"{MCF_API_BASE}/jobs/{job_uuid}")
-        response.raise_for_status()
-        job_data = response.json()
-
-    job = JobListing(
-        uuid=job_data.get("uuid", ""),
-        title=job_data.get("title", ""),
-        company=job_data.get("postedCompany", {}).get("name", ""),
-        salary_min=job_data.get("salary", {}).get("minimum"),
-        salary_max=job_data.get("salary", {}).get("maximum"),
-        skills=[s.get("skill", "") for s in job_data.get("skills", [])],
-        position_level=", ".join(
-            p.get("position", "") for p in job_data.get("positionLevels", [])
-        ),
-    )
+    profile = await resolve_profile(profile_json, resume_text)
+    job = await resolve_job(job_uuid, job_json)
+    if not job:
+        raise HTTPException(status_code=400, detail="No job selected")
 
     prep = await agent_interview_prep(profile, job)
     return prep.model_dump()
 
-# ─── DOCX Resume Generator ───────────────────────────────────────
+# ─── Skill gaps (SkillsFuture Skills Framework) ──────────────────
 
-async def generate_resume_docx(
-    profile: ProfileData,
-    rewrite: ResumeRewrite | None = None,
-    target_job: JobListing | None = None,
-) -> str:
-    """Generate a professional DOCX resume file. Returns the file path."""
-    doc = Document()
-    
-    # Title
-    title = doc.add_heading(profile.name, level=0)
-    title.runs[0].font.color.rgb = None
-    
-    # Contact line
-    doc.add_paragraph(profile.title)
-    
-    # Summary
-    doc.add_heading("Professional Summary", level=1)
-    summary_text = rewrite.rewritten_summary if rewrite else profile.summary
-    doc.add_paragraph(summary_text)
-    
-    # Skills
-    doc.add_heading("Skills", level=1)
-    doc.add_paragraph(", ".join(profile.skills))
-    
-    # Experience
-    doc.add_heading("Work Experience", level=1)
-    for job in profile.work_history:
-        heading = f"{job.get('role', '')} — {job.get('company', '')}"
-        doc.add_heading(heading, level=2)
-        doc.add_paragraph(job.get('duration', ''), style='Normal')
-        for achievement in job.get('achievements', []):
-            doc.add_paragraph(achievement, style='List Bullet')
-    
-    # Optimized bullets (if rewrite exists)
-    if rewrite and rewrite.optimized_bullets:
-        doc.add_heading("Key Achievements", level=1)
-        for bullet in rewrite.optimized_bullets:
-            doc.add_paragraph(bullet, style='List Bullet')
-    
-    # Education
-    if profile.education:
-        doc.add_heading("Education", level=1)
-        for edu in profile.education:
-            doc.add_paragraph(edu, style='List Bullet')
-    
-    # Certifications
-    if profile.certifications:
-        doc.add_heading("Certifications", level=1)
-        for cert in profile.certifications:
-            doc.add_paragraph(cert, style='List Bullet')
-    
-    # Save to temp file
-    fd, path = tempfile.mkstemp(suffix=f"_{profile.name.replace(' ', '_')}_Resume.docx")
-    os.close(fd)
-    doc.save(path)
-    
-    return path
+async def agent_skill_gap(profile: ProfileData, role_id: int, jobs: list[JobListing]) -> dict:
+    """Compare the profile with an official Skills Framework role and explain every gap."""
+    import skills_gap as sg
+    from matching import normalize
 
-# ─── Browser Automation Agent ────────────────────────────────────
+    role = sg.role_details(role_id)
+    needed = sg.role_skills(role_id)
+    # Rank the role's skills by how much the user's matched listings and profile talk about them
+    corpus = normalize(" ".join(t for j in jobs for t in (j.skills + [j.title])) + " " + " ".join(profile.skills))
+    def relevance(skill):
+        words = [w for w in normalize(skill["title"]).split() if len(w) > 3 and w not in {"management", "and", "development"}]
+        return sum(corpus.count(f" {w} ") for w in words) + (1 if skill["type"].startswith("Critical") else 0)
+    ranked = sorted(needed, key=relevance, reverse=True)
+    assessed, others = ranked[:20], ranked[20:]
 
-async def agent_apply_to_job(
-    job_url: str,
-    resume_file_path: str,
-    profile: ProfileData,
-) -> dict:
-    """
-    Open the job URL in a headless browser, fill the application form,
-    upload the resume, and submit.
-    
-    Returns a status report of what happened.
-    """
-    result = {
-        "status": "started",
-        "url": job_url,
-        "steps": [],
-        "errors": [],
-        "success": False,
+    system_prompt = """You are a career coach in Singapore who explains SkillsFuture Skills Framework
+requirements in plain, encouraging English to job seekers (no jargon, no acronyms like TSC).
+For each skill, compare it with the candidate's profile and decide:
+- "strong": the profile clearly shows this skill at roughly the required level
+- "partial": some related experience, but not clearly at the required level
+- "gap": nothing in the profile shows it yet
+Be honest and specific. Quote or paraphrase the candidate's own experience as evidence; never invent any.
+Write every explanation to the candidate directly ("you", "your"), never "the candidate"."""
+    candidate = {
+        "title": profile.title, "years": profile.experience_years, "skills": profile.skills,
+        "summary": profile.summary[:500],
+        "experience": [{"role": w.get("role"), "achievements": (w.get("achievements") or [])[:4]}
+                       for w in profile.work_history[:4] if isinstance(w, dict)],
+        "certifications": profile.certifications,
     }
-    
+    skills_in = [{"i": i, "skill": s["title"], "level": s["level"], "means": s["description"][:160],
+                  "at_this_level": s["level_description"][:160]} for i, s in enumerate(assessed)]
+    user_prompt = (
+        f"Target role: {role['role']} ({role['sector']} sector)\n\nCandidate:\n{json.dumps(candidate, separators=(',', ':'))}\n\n"
+        f"Skills this role needs (official Skills Framework):\n{json.dumps(skills_in, separators=(',', ':'))}\n\n"
+        'Return JSON: {"overview": "2 sentences on overall readiness, speaking to the candidate as you", "skills": [{"i": 0, "status": "strong|partial|gap", '
+        '"evidence": "from their profile, or empty", "why_it_matters": "max 30 words, for this role", '
+        '"how_to_build": "1-2 concrete next steps, max 35 words"}]}'
+    )
+    schema = {"type": "object", "properties": {
+        "overview": {"type": "string"},
+        "skills": {"type": "array", "items": {"type": "object", "properties": {
+            "i": {"type": "integer"}, "status": {"type": "string", "enum": ["strong", "partial", "gap"]},
+            "evidence": {"type": "string"}, "why_it_matters": {"type": "string"}, "how_to_build": {"type": "string"}},
+            "required": ["i", "status"]}}},
+        "required": ["overview", "skills"]}
+    result = await call_llm_structured(system_prompt, user_prompt, schema, temperature=0)
+
+    for item in result.get("skills", []):
+        try:
+            skill = assessed[int(item["i"])]
+        except (KeyError, IndexError, TypeError, ValueError):
+            continue
+        status = item.get("status")
+        skill["status"] = status if status in {"strong", "partial", "gap"} else "gap"
+        skill["evidence"] = str(item.get("evidence") or "")[:300]
+        skill["why_it_matters"] = str(item.get("why_it_matters") or "")[:300]
+        skill["how_to_build"] = str(item.get("how_to_build") or "")[:300]
+    for skill in assessed:
+        skill.setdefault("status", "gap")
+    order = {"gap": 0, "partial": 1, "strong": 2}
+    assessed.sort(key=lambda s: (order[s["status"]], -int(s["level"] or 0)))
+
+    counts = {k: sum(1 for s in assessed if s["status"] == k) for k in order}
+    return {
+        "role": {"id": role["id"], "role": role["role"], "sector": role["sector"], "track": role["track"],
+                 "description": role["description"], "functions": role["functions"]},
+        "overview": str(result.get("overview", "")),
+        "counts": counts,
+        "skills": assessed,
+        "other_skills": [{"title": s["title"], "level": s["level"], "type": s["type"],
+                          "description": s["description"], "course_search_url": s["course_search_url"]} for s in others],
+        "market": sg.market_signals(profile, jobs),
+        "source": "SkillsFuture Skills Framework (jobsandskills.swda.gov.sg)",
+    }
+
+def _jobs_from_form(jobs_json: Optional[str]) -> list[JobListing]:
     try:
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=True, args=BROWSER_ARGS)
-            context = await browser.new_context(
-                viewport={"width": 1280, "height": 900},
-                user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            )
-            page = await context.new_page()
-            
-            # Step 1: Navigate to job page
-            result["steps"].append("Navigating to job page...")
+        return [JobListing.model_validate(j) for j in json.loads(jobs_json or "[]")][:40]
+    except (ValueError, TypeError):
+        return []
+
+@app.post("/api/skills/roles")
+async def skills_roles(profile_json: str = Form(None), target_role: str = Form(""), target_industry: str = Form("")):
+    """Official Skills Framework job roles that match the target role."""
+    import skills_gap as sg
+    profile = await resolve_profile(profile_json, None)
+    try:
+        roles = sg.find_roles(target_role or profile.title, target_industry)
+    except sg.FrameworkMissing as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return {"roles": roles}
+
+@app.post("/api/skills/gap")
+async def skills_gap_analysis(profile_json: str = Form(None), role_id: int = Form(...), jobs_json: str = Form(None)):
+    """Compare the profile with one Skills Framework role, explain gaps, and add market signals."""
+    import skills_gap as sg
+    profile = await resolve_profile(profile_json, None)
+    try:
+        return await agent_skill_gap(profile, role_id, _jobs_from_form(jobs_json))
+    except sg.FrameworkMissing as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except KeyError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+# ─── Tailored resumes (templates, ATS rules) ─────────────────────
+
+# Writing rules distilled from sg-job-hunter's ats-rules.yml and cv.example.md
+ATS_WRITING_RULES = """ATS writing rules (follow all):
+- Never invent employers, job titles, dates, qualifications, tools or numbers. Only rephrase,
+  reorder and emphasise what the candidate actually has. If a result has no real figure,
+  describe its scope instead of making one up.
+- Bullets: start with a strong past-tense action verb, then what was done, then the result
+  ("Grew X by Y% by doing Z"). One line, at most about 25 words. No "Responsible for".
+- Mirror the job's exact wording for skills the candidate genuinely has (e.g. write
+  "Search Engine Optimisation (SEO)" if the job says so), so keyword filters match.
+- No first-person pronouns (I, me, my). No hidden text or keyword stuffing.
+- Summary: 2-3 sentences, about 40-70 words. Open with the target title and years of
+  experience, then the strongest relevant achievement, then what they bring to this role.
+- Core competencies: 6-10 short keyword phrases taken from the job that the candidate has.
+- Keep every experience entry, in the same order. Rewrite each of the candidate's existing
+  bullets; you may reorder them so the most relevant comes first, but never add a bullet
+  that has no original, and return at most as many bullets as the entry had.
+- Competencies and skills may only include things the candidate already lists or clearly
+  shows in their bullets. Job keywords they lack belong in "suggested_keywords" instead."""
+
+def profile_to_resume(profile: ProfileData) -> "ResumeDoc":
+    """Everything factual comes straight from the profile; the AI only rewrites wording."""
+    from resume_render import ResumeDoc, ExperienceEntry, EducationEntry, CertificationEntry, SkillGroup
+
+    def split_edu(text: str) -> EducationEntry:
+        year = re.search(r"(19|20)\d{2}(\s*[-–]\s*((19|20)\d{2}|present))?", text, re.I)
+        rest = text.replace(year.group(0), "").strip(" ,()-–") if year else text
+        title, _, org = rest.partition(",")
+        return EducationEntry(title=title.strip(), org=org.strip(), year=year.group(0) if year else "")
+
+    return ResumeDoc(
+        name=profile.name, title=profile.title, email=profile.email, phone=profile.phone,
+        linkedin=profile.linkedin, portfolio=profile.portfolio, location=profile.location,
+        summary=profile.summary,
+        experience=[
+            ExperienceEntry(company=w.get("company", ""), role=w.get("role", ""),
+                            period=w.get("duration", ""), bullets=list(w.get("achievements") or []))
+            for w in profile.work_history if isinstance(w, dict)
+        ],
+        education=[split_edu(e) for e in profile.education if e],
+        certifications=[CertificationEntry(title=c) for c in profile.certifications if c],
+        skills=[SkillGroup(category="Skills", items=profile.skills)] if profile.skills else [],
+    )
+
+async def agent_tailor_resume(profile: ProfileData, job: JobListing) -> dict:
+    """Return a tailored ResumeDoc for one job, plus the job's keywords and what changed."""
+    base = profile_to_resume(profile)
+    system_prompt = f"""You are an expert resume writer for the Singapore job market.
+Tailor the candidate's resume to one job so it passes ATS keyword screening and reads
+well to a recruiter.
+
+{ATS_WRITING_RULES}"""
+
+    candidate = {
+        "target_title": job.title,
+        "current_title": profile.title,
+        "experience_years": profile.experience_years,
+        "summary": profile.summary,
+        "skills": profile.skills,
+        "experience": [{"index": i, "role": e.role, "company": e.company, "bullets": e.bullets}
+                       for i, e in enumerate(base.experience)],
+        "certifications": profile.certifications,
+    }
+    job_info = {
+        "title": job.title, "company": job.company, "level": job.position_level,
+        "min_years": job.experience_required, "skill_tags": job.skills[:20],
+        "description": (job.description or "")[:2500],
+    }
+    user_prompt = (
+        f"Candidate:\n{json.dumps(candidate, separators=(',', ':'))}\n\nJob:\n{json.dumps(job_info, separators=(',', ':'))}\n\n"
+        "Return JSON with: job_keywords (8-12 most important skills/terms this job screens for, in the job's "
+        "own wording), summary, competencies, experience (one item per candidate experience index, with "
+        "rewritten bullets, no more than it had), skills (grouped, e.g. Tools / Marketing / Languages, only skills "
+        "the candidate has), suggested_keywords (important job keywords the candidate does not show), and changes "
+        "(3-5 short notes telling the candidate what you changed and why)."
+    )
+    schema = {
+        "type": "object",
+        "properties": {
+            "job_keywords": {"type": "array", "items": {"type": "string"}},
+            "summary": {"type": "string"},
+            "competencies": {"type": "array", "items": {"type": "string"}},
+            "experience": {"type": "array", "items": {"type": "object", "properties": {
+                "index": {"type": "integer"}, "bullets": {"type": "array", "items": {"type": "string"}}}}},
+            "skills": {"type": "array", "items": {"type": "object", "properties": {
+                "category": {"type": "string"}, "items": {"type": "array", "items": {"type": "string"}}}}},
+            "suggested_keywords": {"type": "array", "items": {"type": "string"}},
+            "changes": {"type": "array", "items": {"type": "string"}},
+        },
+        "required": ["job_keywords", "summary", "competencies", "experience", "skills"],
+    }
+    result = await call_llm_structured(system_prompt, user_prompt, schema, temperature=0.3)
+
+    # ── Guardrails: the AI may rephrase, never add. Enforced here, not just in the prompt.
+    from matching import normalize, skill_variants
+    from resume_render import SkillGroup
+    evidence = normalize(" ".join([profile.title, profile.summary, " ".join(profile.skills), " ".join(profile.certifications),
+                                   " ".join(b for e in base.experience for b in e.bullets)]))
+
+    def backed(term: str) -> bool:
+        return any(f" {v} " in evidence for v in skill_variants(term))
+
+    suggestions: list[str] = [str(k).strip() for k in result.get("suggested_keywords", []) if str(k).strip()]
+    doc = base.model_copy(deep=True)
+    doc.title = job.title if profile.title.lower() not in job.title.lower() else profile.title
+    doc.summary = str(result.get("summary") or base.summary).strip()
+    doc.competencies = []
+    for c in (str(c).strip() for c in result.get("competencies", [])):
+        (doc.competencies if c and backed(c) else suggestions).append(c)
+    doc.competencies = doc.competencies[:10]
+    for item in result.get("experience", []):
+        try:
+            entry = doc.experience[int(item["index"])]
+        except (KeyError, IndexError, TypeError, ValueError):
+            continue
+        bullets = [str(b).strip() for b in item.get("bullets", []) if str(b).strip()]
+        if bullets and entry.bullets:
+            entry.bullets = bullets[:len(entry.bullets)]  # never more bullets than the original
+    groups = []
+    for g in result.get("skills", []):
+        if not isinstance(g, dict):
+            continue
+        items = []
+        for i in (str(i).strip() for i in g.get("items", [])):
+            (items if i and backed(i) else suggestions).append(i)
+        if items:
+            groups.append(SkillGroup(category=str(g.get("category", "")), items=items))
+    if groups:
+        doc.skills = groups
+    keywords = [str(k).strip() for k in result.get("job_keywords", []) if str(k).strip()][:12]
+    suggestions = [s for s in dict.fromkeys(s for s in suggestions if s) if not backed(s)][:8]
+    return {"resume": doc, "job_keywords": keywords, "suggested_keywords": suggestions,
+            "changes": [str(c) for c in result.get("changes", [])][:5]}
+
+def _resume_from_form(resume_json: str) -> "ResumeDoc":
+    from resume_render import ResumeDoc
+    try:
+        return ResumeDoc.model_validate_json(resume_json)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid resume data")
+
+@app.get("/api/resume/templates")
+async def resume_templates():
+    from resume_render import list_templates
+    return list_templates()
+
+@app.post("/api/resume/tailor")
+async def tailor_resume(
+    profile_json: str = Form(None),
+    resume_text: str = Form(None),
+    job_uuid: str = Form(None),
+    job_json: str = Form(None),
+    template: str = Form("ats"),
+):
+    """Tailor the resume to one job and score it against the ATS rules."""
+    from resume_render import ats_check
+    profile = await resolve_profile(profile_json, resume_text)
+    job = await resolve_job(job_uuid, job_json)
+    if not job:
+        raise HTTPException(status_code=400, detail="No job selected")
+    tailored = await agent_tailor_resume(profile, job)
+    keywords = tailored["job_keywords"] or job.skills[:10]
+    return {
+        "resume": tailored["resume"].model_dump(),
+        "job_keywords": keywords,
+        "suggested_keywords": tailored["suggested_keywords"],
+        "changes": tailored["changes"],
+        "ats": ats_check(tailored["resume"], keywords, template),
+    }
+
+@app.post("/api/resume/ats")
+async def resume_ats(resume_json: str = Form(...), job_keywords: str = Form("[]"), template: str = Form("ats")):
+    """Re-score an edited resume (instant, no AI)."""
+    from resume_render import ats_check
+    try:
+        keywords = [str(k) for k in json.loads(job_keywords or "[]")]
+    except ValueError:
+        keywords = []
+    return ats_check(_resume_from_form(resume_json), keywords, template)
+
+@app.post("/api/resume/render")
+async def resume_render_html(resume_json: str = Form(...), template: str = Form("ats")):
+    """HTML preview of a resume in a template (what the PDF will look like)."""
+    from fastapi.responses import HTMLResponse
+    from resume_render import render_html
+    return HTMLResponse(render_html(_resume_from_form(resume_json), template))
+
+@app.post("/api/resume/export")
+async def resume_export(resume_json: str = Form(...), template: str = Form("ats"), format: str = Form("pdf")):
+    """Download the resume as PDF (in the chosen template) or Word."""
+    from fastapi.responses import Response
+    from resume_render import render_html, render_pdf, render_docx
+    doc = _resume_from_form(resume_json)
+    base = re.sub(r"[^A-Za-z0-9]+", "_", doc.name or "CareerFlow").strip("_") or "CareerFlow"
+    if format == "docx":
+        return Response(render_docx(doc),
+                        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                        headers={"Content-Disposition": f'attachment; filename="{base}_Resume.docx"'})
+    pdf = await render_pdf(render_html(doc, template))
+    return Response(pdf, media_type="application/pdf",
+                    headers={"Content-Disposition": f'attachment; filename="{base}_Resume.pdf"'})
+
+# ─── Assisted apply (you review and submit) ──────────────────────
+
+# One visible application window at a time; it closes itself after APPLY_WINDOW_MINUTES
+APPLY_SESSION: dict = {}
+APPLY_WINDOW_MINUTES = 20
+
+async def close_apply_window():
+    session = APPLY_SESSION.copy()
+    APPLY_SESSION.clear()
+    for key in ("browser", "playwright"):
+        try:
+            if session.get(key):
+                await (session[key].close() if key == "browser" else session[key].stop())
+        except Exception:
+            pass
+    if session.get("timer"):
+        session["timer"].cancel()
+
+async def agent_open_application(job_url: str, resume_pdf: str, profile: ProfileData) -> dict:
+    """
+    Open the job in a VISIBLE browser window on this computer, go to the application form
+    if there is an "Apply" link, fill in the candidate's real details and attach their
+    tailored resume. It never clicks Submit: the candidate checks everything and submits.
+    """
+    result = {"status": "started", "url": job_url, "steps": [], "errors": [], "filled": []}
+    await close_apply_window()
+    try:
+        pw = await async_playwright().start()
+        browser = await pw.chromium.launch(headless=False)
+        page = await (await browser.new_context(viewport=None)).new_page()
+        APPLY_SESSION.update(playwright=pw, browser=browser)
+        APPLY_SESSION["timer"] = asyncio.get_running_loop().call_later(
+            APPLY_WINDOW_MINUTES * 60, lambda: asyncio.ensure_future(close_apply_window()))
+
+        await page.goto(job_url, wait_until="domcontentloaded", timeout=30000)
+        result["steps"].append("Opened the job page in a new browser window")
+
+        # Follow an "Apply" link or button to the form. These open a form; they don't submit one.
+        for selector in ['a:text-is("Apply")', 'a:text-is("Apply Now")', 'a:has-text("Apply for this job")',
+                         'button:text-is("Apply")', 'button:text-is("Apply Now")', 'button:has-text("Apply for this job")']:
             try:
-                await page.goto(job_url, wait_until="domcontentloaded", timeout=30000)
-                result["steps"].append(f"Loaded: {page.url}")
-            except Exception as e:
-                result["errors"].append(f"Failed to load page: {str(e)}")
-                await browser.close()
-                result["status"] = "failed"
-                return result
-            
-            # Step 2: Look for and click "Apply" button
-            result["steps"].append("Looking for Apply button...")
-            apply_selectors = [
-                'button:has-text("Apply")',
-                'button:has-text("Apply Now")',
-                'button:has-text("Apply for this job")',
-                'a:has-text("Apply")',
-                'button[type="submit"]',
-                '[data-testid="apply-button"]',
-            ]
-            
-            apply_clicked = False
-            for selector in apply_selectors:
+                el = await page.wait_for_selector(selector, timeout=1500, state="visible")
+                if el:
+                    await el.click()
+                    await page.wait_for_load_state("domcontentloaded", timeout=10000)
+                    result["steps"].append("Clicked the Apply link to reach the form")
+                    break
+            except Exception:
+                continue
+
+        first, _, last = profile.name.partition(" ")
+        fields = [
+            ("first name", first, ['input[name*="first" i]', 'input[placeholder*="first name" i]', 'input[autocomplete="given-name"]']),
+            ("last name", last, ['input[name*="last" i]', 'input[placeholder*="last name" i]', 'input[autocomplete="family-name"]']),
+            ("full name", profile.name, ['input[name="name"]', 'input[name*="fullname" i]', 'input[name*="full_name" i]',
+                                         'input[placeholder*="full name" i]', 'input[autocomplete="name"]']),
+            ("email", profile.email, ['input[type="email"]', 'input[name*="email" i]', 'input[placeholder*="email" i]']),
+            ("phone", profile.phone, ['input[type="tel"]', 'input[name*="phone" i]', 'input[name*="mobile" i]', 'input[placeholder*="phone" i]']),
+            ("LinkedIn", profile.linkedin, ['input[name*="linkedin" i]', 'input[placeholder*="linkedin" i]']),
+        ]
+        for label, value, selectors in fields:
+            if not value:
+                continue
+            for selector in selectors:
                 try:
-                    btn = await page.wait_for_selector(selector, timeout=3000)
-                    if btn:
-                        await btn.click()
-                        result["steps"].append(f"Clicked apply button ({selector})")
-                        apply_clicked = True
-                        await page.wait_for_load_state("domcontentloaded", timeout=10000)
+                    el = await page.query_selector(selector)
+                    if el and await el.is_visible() and not await el.input_value():
+                        await el.fill(value)
+                        result["filled"].append(label)
                         break
                 except Exception:
                     continue
-            
-            if not apply_clicked:
-                result["steps"].append("No apply button found, proceeding with form fill on current page")
-            
-            # Step 3: Fill common form fields
-            result["steps"].append("Filling application form...")
-            
-            # Name fields
-            name_fields = [
-                ('input[name="firstName"]', profile.name.split()[0] if profile.name else ""),
-                ('input[name="lastName"]', " ".join(profile.name.split()[1:]) if len(profile.name.split()) > 1 else ""),
-                ('input[name="first_name"]', profile.name.split()[0] if profile.name else ""),
-                ('input[name="last_name"]', " ".join(profile.name.split()[1:]) if len(profile.name.split()) > 1 else ""),
-                ('input[name="fullName"]', profile.name),
-                ('input[name="full_name"]', profile.name),
-                ('input[name="name"]', profile.name),
-                ('input[placeholder*="First name" i]', profile.name.split()[0] if profile.name else ""),
-                ('input[placeholder*="Last name" i]', " ".join(profile.name.split()[1:]) if len(profile.name.split()) > 1 else ""),
-                ('input[placeholder*="Full name" i]', profile.name),
-            ]
-            
-            for selector, value in name_fields:
-                try:
-                    field = await page.wait_for_selector(selector, timeout=2000)
-                    if field and value:
-                        await field.fill(value)
-                        result["steps"].append(f"Filled: {selector}")
-                except Exception:
-                    continue
-            
-            # Email field
-            email_selectors = [
-                'input[type="email"]',
-                'input[name="email"]',
-                'input[name="emailAddress"]',
-                'input[name="email_address"]',
-                'input[placeholder*="email" i]',
-            ]
-            # Use a generic email based on name
-            email = f"{profile.name.lower().replace(' ', '.')}@email.com"
-            for selector in email_selectors:
-                try:
-                    field = await page.wait_for_selector(selector, timeout=2000)
-                    if field:
-                        await field.fill(email)
-                        result["steps"].append(f"Filled email: {selector}")
-                        break
-                except Exception:
-                    continue
-            
-            # Phone field
-            phone_selectors = [
-                'input[type="tel"]',
-                'input[name="phone"]',
-                'input[name="phoneNumber"]',
-                'input[name="phone_number"]',
-                'input[placeholder*="phone" i]',
-            ]
-            for selector in phone_selectors:
-                try:
-                    field = await page.wait_for_selector(selector, timeout=2000)
-                    if field:
-                        await field.fill("+65 9123 4567")
-                        result["steps"].append(f"Filled phone: {selector}")
-                        break
-                except Exception:
-                    continue
-            
-            # Step 4: Upload resume
-            result["steps"].append("Uploading resume...")
-            upload_selectors = [
-                'input[type="file"]',
-                'input[accept*="pdf"]',
-                'input[accept*="doc"]',
-                'input[accept*="resume"]',
-                'input[name="resume"]',
-                'input[name="cv"]',
-                'input[name="attachment"]',
-                'input[name="file"]',
-                'input[name="document"]',
-            ]
-            
-            resume_uploaded = False
-            for selector in upload_selectors:
-                try:
-                    file_input = await page.wait_for_selector(selector, timeout=2000)
-                    if file_input:
-                        await file_input.set_input_files(resume_file_path)
-                        result["steps"].append(f"Uploaded resume to: {selector}")
-                        resume_uploaded = True
-                        await page.wait_for_timeout(2000)  # Wait for upload
-                        break
-                except Exception:
-                    continue
-            
-            if not resume_uploaded:
-                result["errors"].append("Could not find file upload field")
-            
-            # Step 5: Look for and click Submit
-            result["steps"].append("Looking for Submit button...")
-            submit_selectors = [
-                'button:has-text("Submit")',
-                'button:has-text("Submit Application")',
-                'button:has-text("Submit Application Now")',
-                'button[type="submit"]',
-                'input[type="submit"]',
-                'button:has-text("Complete Application")',
-            ]
-            
-            submitted = False
-            for selector in submit_selectors:
-                try:
-                    btn = await page.wait_for_selector(selector, timeout=3000)
-                    if btn:
-                        await btn.click()
-                        result["steps"].append(f"Clicked submit: {selector}")
-                        submitted = True
-                        await page.wait_for_timeout(3000)  # Wait for submission
-                        break
-                except Exception:
-                    continue
-            
-            # Take screenshot for debugging
-            screenshot_path = tempfile.mktemp(suffix="_screenshot.png")
-            await page.screenshot(path=screenshot_path)
-            result["screenshot"] = screenshot_path
-            
-            await browser.close()
-            
-            result["status"] = "completed"
-            result["success"] = resume_uploaded and submitted
-            if not submitted:
-                result["errors"].append("Could not find submit button")
-            
+
+        uploaded = False
+        for el in await page.query_selector_all('input[type="file"]'):
+            try:
+                await el.set_input_files(resume_pdf)
+                uploaded = True
+                break
+            except Exception:
+                continue
+        if result["filled"]:
+            result["steps"].append(f"Filled in your {', '.join(result['filled'])}")
+        if uploaded:
+            result["steps"].append("Attached your tailored resume (PDF)")
+        if not result["filled"] and not uploaded:
+            result["errors"].append(
+                "No application form was found on this page yet. Many sites (including MyCareersFuture) ask you to "
+                "sign in first: sign in in the browser window, then fill in the form.")
+        result["steps"].append("Stopped before submitting. Check everything in the browser window, then press Submit yourself.")
+        result["status"] = "ready_for_review"
+        result["resume_pdf"] = resume_pdf
     except Exception as e:
         result["status"] = "failed"
-        result["errors"].append(f"Browser automation error: {str(e)}")
-    
+        result["errors"].append(f"Couldn't open the application window: {e}")
+        await close_apply_window()
     return result
 
 # ─── Authentication (Invite Code Gatekeeping) ────────────────────
 
 INVITE_CODES = {
-    c.strip() for c in os.getenv("INVITE_CODES", "careerflow2026,hackathon,metaai").split(",") if c.strip()
+    c.strip() for c in os.getenv("INVITE_CODES", "bertbrainco").split(",") if c.strip()
 }
 TOKEN_TTL_SECONDS = 30 * 24 * 3600
 
@@ -1093,88 +1171,47 @@ async def check_auth(token: str = ""):
     """Check if the provided token is valid."""
     return {"authenticated": token_is_valid(token)}
 
-# ─── Agentic Apply Endpoints ─────────────────────────────────────
-
-@app.post("/api/resume/generate-docx")
-async def generate_docx(
-    resume_text: str = Form(...),
-    job_uuid: str = Form(None),
-):
-    """Generate a downloadable DOCX resume file."""
-    profile = await agent_parse_profile(resume_text)
-    
-    rewrite = None
-    target_job = None
-    
-    if job_uuid:
-        # Fetch job and rewrite resume for it
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.get(f"{MCF_API_BASE}/jobs/{job_uuid}")
-            response.raise_for_status()
-            job_data = response.json()
-        
-        target_job = JobListing(
-            uuid=job_data.get("uuid", ""),
-            title=job_data.get("title", ""),
-            company=job_data.get("postedCompany", {}).get("name", ""),
-            salary_min=job_data.get("salary", {}).get("minimum"),
-            salary_max=job_data.get("salary", {}).get("maximum"),
-            skills=[s.get("skill", "") for s in job_data.get("skills", [])],
-            description=job_data.get("description", ""),
-        )
-        
-        rewrite = await agent_rewrite_resume(profile, target_job)
-    
-    file_path = await generate_resume_docx(profile, rewrite, target_job)
-    
-    return FileResponse(
-        path=file_path,
-        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-        filename=f"{profile.name.replace(' ', '_')}_Resume.docx",
-    )
+# ─── Assisted apply endpoint ─────────────────────────────────────
 
 @app.post("/api/apply")
 async def apply_to_job(
     job_url: str = Form(...),
-    resume_text: str = Form(...),
+    profile_json: str = Form(None),
+    resume_text: str = Form(None),
+    resume_json: str = Form(None),
+    template: str = Form("ats"),
     job_uuid: str = Form(None),
+    job_json: str = Form(None),
 ):
     """
-    Agentic Apply: Generate optimized resume, then auto-fill and submit the job application.
-    This is the holy grail: one click to apply.
+    Assisted apply: save the tailored resume as a PDF, open the job in a visible browser,
+    fill in the candidate's real details and attach the PDF. The candidate submits.
     """
-    # Step 1: Parse profile
-    profile = await agent_parse_profile(resume_text)
-    
-    # Step 2: Generate optimized DOCX
-    target_job = None
-    if job_uuid:
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.get(f"{MCF_API_BASE}/jobs/{job_uuid}")
-            response.raise_for_status()
-            job_data = response.json()
-        
-        target_job = JobListing(
-            uuid=job_data.get("uuid", ""),
-            title=job_data.get("title", ""),
-            company=job_data.get("postedCompany", {}).get("name", ""),
-            skills=[s.get("skill", "") for s in job_data.get("skills", [])],
-            description=job_data.get("description", ""),
-        )
-    
-    resume_path = await generate_resume_docx(profile, None, target_job)
-    
-    # Step 3: Browser automation - fill and submit (one browser at a time)
-    async with BROWSER_LOCK:
-        result = await agent_apply_to_job(job_url, resume_path, profile)
-    
-    # Cleanup temp file
-    try:
-        os.unlink(resume_path)
-    except Exception:
-        pass
-    
-    return result
+    from resume_render import render_html, render_pdf
+
+    profile = await resolve_profile(profile_json, resume_text)
+    missing = [label for label, value in [("name", profile.name), ("email", profile.email), ("phone", profile.phone)]
+               if not value.strip()]
+    if missing:
+        raise HTTPException(status_code=400, detail=f"Add your {', '.join(missing)} in My details before applying.")
+    if not re.match(r"^https?://", job_url or ""):
+        raise HTTPException(status_code=400, detail="This job has no application link.")
+
+    resume = _resume_from_form(resume_json) if resume_json else profile_to_resume(profile)
+    for key in ("name", "email", "phone", "linkedin", "portfolio", "location"):
+        setattr(resume, key, getattr(profile, key))
+    out_dir = Path(tempfile.gettempdir()) / "careerflow"
+    out_dir.mkdir(exist_ok=True)
+    pdf_path = out_dir / f"{re.sub(r'[^A-Za-z0-9]+', '_', profile.name).strip('_') or 'Resume'}_Resume.pdf"
+    pdf_path.write_bytes(await render_pdf(render_html(resume, template)))
+
+    return await agent_open_application(job_url, str(pdf_path), profile)
+
+@app.post("/api/apply/close")
+async def close_application_window():
+    """Close the application browser window (it also closes itself after 20 minutes)."""
+    await close_apply_window()
+    return {"closed": True}
 
 # ─── Run ─────────────────────────────────────────────────────────
 
