@@ -77,14 +77,14 @@ Users enter any of these codes to access the app. Tokens are stored in localStor
 
 ## API Keys
 
-- **Groq API Key**: Free tier gives you access to Llama 3.3 70B. Get it at https://console.groq.com/
+- **Groq API Key**: Free tier gives you access to GPT-OSS 120B. Get it at https://console.groq.com/
 - **MyCareersFuture**: Public API, no key needed
 
 ## Tech Stack
 
 - **Frontend**: Next.js 16, React 19, Tailwind CSS 4
 - **Backend**: FastAPI, Python 3.11+
-- **AI**: Groq Llama 3.3 70B (free)
+- **AI**: Groq GPT-OSS 120B (free)
 - **Browser Automation**: Playwright
 - **Data**: MyCareersFuture SG API
 

@@ -25,7 +25,7 @@ This is the **only thing you need to do manually**:
 2. Sign in or create an account
 3. Click **Create API Key** and copy it (it starts with `gsk_`)
 
-The free tier includes Llama 3.3 70B, which is what CareerFlow uses.
+The free tier includes GPT-OSS 120B, which is what CareerFlow uses.
 
 ## Step 2: Run the Setup
 
@@ -80,16 +80,16 @@ You should see: `✓ Ready in Xms` → Open **http://localhost:3000**
 
 | Step | What Happens | What the AI Does |
 |------|-------------|--------------|
-| **Profile** | Parse resume → structured data | Llama 3.3 extracts skills, experience, education |
-| **Discover** | Search 80K+ SG jobs, score matches | Llama 3.3 scores each job against your profile (0-100) |
-| **Gap Analysis** | Find missing skills, recommend courses | Llama 3.3 compares profile vs market, suggests SkillsFuture courses |
-| **Prepare** | Rewrite resume for specific job | Llama 3.3 optimizes for ATS, adds keywords, rewrites bullets |
-| **Interview** | Generate mock questions + company research | Llama 3.3 creates behavioral/technical questions, STAR framework hints |
+| **Profile** | Parse resume → structured data | GPT-OSS 120B extracts skills, experience, education |
+| **Discover** | Search 80K+ SG jobs, score matches | GPT-OSS 120B scores each job against your profile (0-100) |
+| **Gap Analysis** | Find missing skills, recommend courses | GPT-OSS 120B compares profile vs market, suggests SkillsFuture courses |
+| **Prepare** | Rewrite resume for specific job | GPT-OSS 120B optimizes for ATS, adds keywords, rewrites bullets |
+| **Interview** | Generate mock questions + company research | GPT-OSS 120B creates behavioral/technical questions, STAR framework hints |
 
 ### Data Sources
 
 - **MyCareersFuture API** (`api.mycareersfuture.gov.sg`) — Public, free, no auth. 80K+ job listings with salary, skills, company data.
-- **Groq API** (`api.groq.com`) — Llama 3.3 70B for all AI processing.
+- **Groq API** (`api.groq.com`) — GPT-OSS 120B for all AI processing.
 
 ## Troubleshooting
 

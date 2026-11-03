@@ -1129,7 +1129,7 @@ export default function Home() {
       <footer className={`border-t border-line ${step === "discover" && jobs.length > 0 ? "pb-20" : ""}`}>
         <div className="max-w-5xl mx-auto px-4 sm:px-6 py-6 flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between text-xs text-muted">
           <p>© {new Date().getFullYear()} CareerFlow SG</p>
-          <p>Job data from MyCareersFuture · AI by Llama 3.3 via Groq</p>
+          <p>Job data from MyCareersFuture · AI by GPT-OSS 120B via Groq</p>
         </div>
       </footer>
     </div>

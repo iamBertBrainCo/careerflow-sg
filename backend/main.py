@@ -28,7 +28,8 @@ load_dotenv()
 LLM_API_KEY = os.getenv("MODEL_API_KEY", "")
 LLM_BASE_URL = "https://api.groq.com/openai/v1"
 MCF_API_BASE = os.getenv("MCF_API_BASE", "https://api.mycareersfuture.gov.sg/v2")
-MODEL_ID = "llama-3.3-70b-versatile" # Using Llama 3.3 70B on Groq
+# Llama 3.3 70B was retired on Groq; override with MODEL_ID if the default is retired too.
+MODEL_ID = os.getenv("MODEL_ID", "openai/gpt-oss-120b")
 
 app = FastAPI(
     title="CareerFlow SG",
@@ -154,10 +155,16 @@ async def call_llm_structured(
     schema: dict,
 ) -> dict:
     """Call the LLM and parse a structured JSON response."""
+    # Not every Groq model supports `json_schema` output, so use JSON mode and
+    # describe the schema in the prompt (JSON mode also requires the word "JSON").
+    system_prompt = (
+        f"{system_prompt}\n\nRespond with a single JSON object only, no prose, "
+        f"matching this JSON Schema:\n{json.dumps(schema)}"
+    )
     text = await call_llm(
         system_prompt=system_prompt,
         user_prompt=user_prompt,
-        response_format={"type": "json_schema", "json_schema": {"schema": schema}},
+        response_format={"type": "json_object"},
     )
     # Parse JSON from response (handle markdown code blocks)
     text = text.strip()
