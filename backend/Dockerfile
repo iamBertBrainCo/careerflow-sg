@@ -1,7 +1,7 @@
 # Use Python 3.11 with system dependencies
 FROM python:3.11-slim
 
-# Install system dependencies for Playwright
+# Install system dependencies for Playwright and PDF processing
 RUN apt-get update && apt-get install -y \
     wget \
     curl \
@@ -27,23 +27,30 @@ RUN apt-get update && apt-get install -y \
     libcairo2 \
     libasound2 \
     libatspi2.0-0 \
+    fonts-liberation \
+    libappindicator3-1 \
+    xdg-utils \
     && rm -rf /var/lib/apt/lists/*
 
 # Set working directory
 WORKDIR /app
 
-# Copy requirements first (for caching)
+# Copy requirements first (for Docker caching)
 COPY requirements.txt .
 
-# Install Python dependencies
+# Install Python dependencies (no cache to save space)
+RUN pip install --no-cache-dir --upgrade pip setuptools wheel
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Install Playwright browsers
+# Install Playwright browsers and dependencies
 RUN playwright install chromium
-RUN playwright install-deps
+RUN playwright install-deps chromium
 
 # Copy application code
 COPY . .
+
+# Create temp directory for generated files
+RUN mkdir -p /tmp/careerflow
 
 # Expose port
 EXPOSE 10000
