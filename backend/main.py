@@ -117,12 +117,22 @@ class InterviewPrep(BaseModel):
 
 # ─── LLM Client (Groq) ───────────────────────────────────────────
 
+def _retry_delay(response: httpx.Response) -> float:
+    """Seconds to wait before retrying a 429, from Groq's headers or message (max 30s)."""
+    import re
+    try:
+        delay = float(response.headers.get("retry-after", ""))
+    except ValueError:
+        match = re.search(r"try again in ([\d.]+)s", response.text)
+        delay = float(match.group(1)) if match else 10.0
+    return min(delay + 0.5, 30.0)
+
 async def call_llm(
     system_prompt: str,
     user_prompt: str,
     tools: Optional[list] = None,
     response_format: Optional[dict] = None,
-    max_tokens: int = 4096,
+    max_tokens: int = 8192,
 ) -> str:
     """Call the LLM (Groq, OpenAI-compatible chat completions)."""
     if not LLM_API_KEY:
@@ -143,23 +153,43 @@ async def call_llm(
             "max_tokens": max_tokens,
             "temperature": 0.7,
         }
+        # GPT-OSS is a reasoning model: its thinking counts against max_tokens and can
+        # leave an empty answer on big prompts (e.g. scoring 30 jobs). Keep it brief.
+        if "gpt-oss" in MODEL_ID:
+            payload["reasoning_effort"] = "low"
         if tools:
             payload["tools"] = tools
         if response_format:
             payload["response_format"] = response_format
 
-        response = await client.post(
-            f"{LLM_BASE_URL}/chat/completions",
-            headers={
-                "Authorization": f"Bearer {LLM_API_KEY}",
-                "Content-Type": "application/json",
-            },
-            json=payload,
-        )
+        # Retry rate limits (free tier: 8k tokens/minute) and the occasional
+        # malformed-JSON generation, waiting as long as Groq asks (capped).
+        for attempt in range(3):
+            response = await client.post(
+                f"{LLM_BASE_URL}/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {LLM_API_KEY}",
+                    "Content-Type": "application/json",
+                },
+                json=payload,
+            )
+            if response.status_code == 429 and attempt < 2:
+                await asyncio.sleep(_retry_delay(response))
+                continue
+            if response.status_code == 400 and "json_validate_failed" in response.text and attempt < 1:
+                continue
+            break
 
-        if response.status_code != 200:
+        if response.status_code == 429:
             raise HTTPException(
-                status_code=response.status_code,
+                status_code=429,
+                detail="The AI service is busy right now. Please wait a minute and try again.",
+            )
+        if response.status_code != 200:
+            print(f"LLM API error {response.status_code}: {response.text[:500]}")
+            # 500, not 502: the frontend retries 502-504 as "server waking up"
+            raise HTTPException(
+                status_code=500,
                 detail=f"LLM API error: {response.text}",
             )
 
@@ -305,30 +335,30 @@ Given a candidate profile and a list of jobs, score each job on a 0-100 scale ba
 - Career progression (15%): Is this a step up, lateral, or step down?
 - Location & logistics (5%): Is the location reasonable?
 
-Return a JSON array with job UUIDs and their match scores."""
+Return a JSON object with each job's id and its match score."""
 
+    # Compact JSON and short numeric ids (not 32-char UUIDs) keep this call well
+    # under the free Groq tier's tokens-per-minute limit.
     profile_summary = json.dumps({
         "skills": profile.skills,
         "experience_years": profile.experience_years,
         "title": profile.title,
         "summary": profile.summary,
-    }, indent=2)
+    }, separators=(",", ":"))
 
     jobs_summary = json.dumps([
         {
-            "uuid": j.uuid,
+            "id": i,
             "title": j.title,
             "company": j.company,
-            "skills": j.skills,
-            "experience_required": j.experience_required,
-            "salary_min": j.salary_min,
-            "salary_max": j.salary_max,
-            "position_level": j.position_level,
+            "skills": j.skills[:12],
+            "exp": j.experience_required,
+            "level": j.position_level,
         }
-        for j in jobs
-    ], indent=2)
+        for i, j in enumerate(jobs)
+    ], separators=(",", ":"))
 
-    user_prompt = f"""Profile:\n{profile_summary}\n\nJobs:\n{jobs_summary}\n\nScore each job and return as JSON array: [{"uuid": "...", "match_score": 0-100}]"""
+    user_prompt = f"""Profile:\n{profile_summary}\n\nJobs:\n{jobs_summary}\n\nScore every job and return JSON: {{"scores": [{{"id": 0, "match_score": 0-100}}]}}"""
 
     schema = {
         "type": "object",
@@ -338,10 +368,10 @@ Return a JSON array with job UUIDs and their match scores."""
                 "items": {
                     "type": "object",
                     "properties": {
-                        "uuid": {"type": "string"},
+                        "id": {"type": "integer"},
                         "match_score": {"type": "number"},
                     },
-                    "required": ["uuid", "match_score"],
+                    "required": ["id", "match_score"],
                 },
             },
         },
@@ -351,9 +381,11 @@ Return a JSON array with job UUIDs and their match scores."""
     result = await call_llm_structured(system_prompt, user_prompt, schema)
 
     # Apply scores to jobs
-    score_map = {s["uuid"]: s["match_score"] for s in result.get("scores", [])}
-    for job in jobs:
-        job.match_score = score_map.get(job.uuid, 0.0)
+    for s in result.get("scores", []):
+        try:
+            jobs[int(s["id"])].match_score = float(s["match_score"])
+        except (KeyError, IndexError, TypeError, ValueError):
+            continue
 
     # Sort by match score descending
     jobs.sort(key=lambda j: j.match_score, reverse=True)
@@ -379,18 +411,18 @@ and expected costs with SkillsFuture subsidies."""
         "skills": profile.skills,
         "experience_years": profile.experience_years,
         "title": profile.title,
-    }, indent=2)
+    }, separators=(",", ":"))
 
     jobs_summary = json.dumps([
         {
             "title": j.title,
             "company": j.company,
-            "skills": j.skills,
+            "skills": j.skills[:15],
             "salary_min": j.salary_min,
             "salary_max": j.salary_max,
         }
         for j in top_jobs[:10]
-    ], indent=2)
+    ], separators=(",", ":"))
 
     user_prompt = f"""Candidate Profile:\n{profile_summary}\n\nTop Matching Jobs:\n{jobs_summary}\n\nAnalyze gaps and recommend specific upskilling paths for Singapore."""
 
@@ -654,8 +686,9 @@ async def gap_analysis(
         from scrapers import scrape_all_portals
         jobs = await scrape_all_portals(query, limit=30, sources=source_list)
     
-    matched = await agent_match_jobs(profile, jobs, target_role=target_role, target_industry=target_industry)
-    gaps = await agent_gap_analysis(profile, matched, target_role=target_role, target_industry=target_industry)
+    # Search results are already relevance-ordered; skipping a second scoring pass
+    # halves the LLM tokens this endpoint needs (free tier: 8k tokens/minute).
+    gaps = await agent_gap_analysis(profile, jobs, target_role=target_role, target_industry=target_industry)
     return gaps.model_dump()
 
 @app.post("/api/resume/rewrite")
